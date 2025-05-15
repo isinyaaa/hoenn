@@ -2,6 +2,7 @@ package main
 
 import "base:runtime"
 import sa "core:container/small_array"
+import "core:fmt"
 import "core:log"
 import "core:math"
 import "core:math/linalg/glsl"
@@ -44,8 +45,10 @@ when ODIN_OS == .Darwin {
 // Enables Vulkan debug logging and validation layers
 ENABLE_VALIDATION_LAYERS :: #config(ENABLE_VALIDATION_LAYERS, ODIN_DEBUG)
 
-CSHADER :: #load("shaders/gradient.spv")
-SKYSHADER :: #load("shaders/sky.spv")
+GRAD_SHADER :: #load("shaders/gradient.spv")
+SKY_SHADER :: #load("shaders/sky.spv")
+COLORED_TRIANGLE_SHADER :: #load("shaders/colored_triangle.spv")
+FLAT_SHADER :: #load("shaders/flat.spv")
 
 INIT_RES :: [2]i32{1920, 1080}
 PROG :: "vk"
@@ -78,14 +81,33 @@ Re :: struct($N: int) where N >= 0 {
 	fences: [N]vk.Fence,
 }
 
-Effect_Type :: enum {
+Shader_Type :: enum {
+	gradient,
+	sky,
+	colored_triangle,
+	flat,
+}
+
+Pipe_Type :: enum {
+	compute,
+	gfx,
+}
+
+Compute_Effect :: enum {
 	gradient,
 	sky,
 }
 
-Effect :: struct {
-	// name:     string,
-	shader:   vk.ShaderModule,
+Gfx_Pipe :: enum {
+	triangle,
+}
+
+Screen_Pipe :: union {
+	Compute_Effect,
+	Gfx_Pipe,
+}
+
+Pipeline :: struct {
 	pipeline: vk.Pipeline,
 	layout:   vk.PipelineLayout,
 }
@@ -122,7 +144,8 @@ state := struct {
 	},
 	ext:             vk.Extent2D,
 	drawimg:         Image,
-	effects:         [Effect_Type]Effect,
+	shaders:         [Shader_Type]vk.ShaderModule,
+	modes:           [Pipe_Type]#soa[2]Pipeline,
 	// cshadem:         vk.ShaderModule,
 	// skyshadem:       vk.ShaderModule,
 	cds:             vk.DescriptorSet,
@@ -247,7 +270,7 @@ main :: proc() {
 			break
 		}
 
-		log.debugf("%v, %d", DEVICE_EXTENSIONS[:], q_infos.len)
+		log.debugf("%v, %d", DEVICE_EXTENSIONS[:])
 		must(
 			vk.CreateDevice(
 				state.physical_device,
@@ -479,16 +502,15 @@ main :: proc() {
 	}
 	// }
 
-	grad := create_shader_module(CSHADER)
-	sky := create_shader_module(SKYSHADER)
-	defer {
-		vk.DestroyShaderModule(state.device, grad, nil)
-		vk.DestroyShaderModule(state.device, sky, nil)
+	state.shaders = [Shader_Type]vk.ShaderModule {
+		.gradient         = create_shader_module(GRAD_SHADER),
+		.sky              = create_shader_module(SKY_SHADER),
+		.colored_triangle = create_shader_module(COLORED_TRIANGLE_SHADER),
+		.flat             = create_shader_module(FLAT_SHADER),
 	}
-	// defer vk.DestroyShaderModule(state.device, state.frag_shader_module, nil)
+	defer for s in state.shaders do vk.DestroyShaderModule(state.device, s, nil)
 
-	// pipeline
-	layout: vk.PipelineLayout
+	// compute pipeline
 	must(
 		vk.CreatePipelineLayout(
 			state.device,
@@ -503,7 +525,7 @@ main :: proc() {
 				},
 			},
 			nil,
-			&layout,
+			&state.modes[.compute].layout[0],
 		),
 	)
 
@@ -513,23 +535,23 @@ main :: proc() {
 			stage = vk.PipelineShaderStageCreateInfo {
 				sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
 				stage = {.COMPUTE},
-				module = grad,
+				module = state.shaders[.gradient],
 				pName = "main",
 			},
-			layout = layout,
+			layout = state.modes[.compute].layout[0],
 		},
 		{
 			sType = .COMPUTE_PIPELINE_CREATE_INFO,
 			stage = vk.PipelineShaderStageCreateInfo {
 				sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
 				stage = {.COMPUTE},
-				module = sky,
+				module = state.shaders[.sky],
 				pName = "main",
 			},
-			layout = layout,
+			layout = state.modes[.compute].layout[0],
 		},
 	}
-	pipes: [2]vk.Pipeline
+	// state.modes[.compute].layout[1] = state.modes[.compute].layout[0]
 	must(
 		vk.CreateComputePipelines(
 			state.device,
@@ -537,19 +559,104 @@ main :: proc() {
 			u32(len(pipe_infos)),
 			raw_data(pipe_infos),
 			nil,
-			raw_data(pipes[:]),
+			raw_data(state.modes[.compute].pipeline[:]),
 		),
 	)
-	state.effects = {
-		.gradient = {pipeline = pipes[0], shader = grad, layout = layout},
-		.sky = {pipeline = pipes[1], shader = sky, layout = layout},
+	log.debugf("%v", state.modes[.compute].pipeline[:])
+	color_attach_render := []vk.Format{.R16G16B16A16_SFLOAT}
+	pipe_render := vk.PipelineRenderingCreateInfo {
+		sType                   = .PIPELINE_RENDERING_CREATE_INFO_KHR,
+		// viewMask:                u32,
+		colorAttachmentCount    = u32(len(color_attach_render)),
+		pColorAttachmentFormats = raw_data(color_attach_render),
+		// depthAttachmentFormat:   Format,
+		// stencilAttachmentFormat: Format,
 	}
-	defer {
-		vk.DestroyPipelineLayout(state.device, layout, nil)
-		for p in pipes {
-			vk.DestroyPipeline(state.device, p, nil)
+	{
+		dynamic_states := []vk.DynamicState{.VIEWPORT, .SCISSOR}
+		must(
+			vk.CreatePipelineLayout(
+				state.device,
+				&vk.PipelineLayoutCreateInfo{sType = .PIPELINE_LAYOUT_CREATE_INFO},
+				nil,
+				&state.modes[.gfx].layout[0],
+			),
+		)
+		stages := []vk.PipelineShaderStageCreateInfo {
+			{
+				sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+				stage = {.VERTEX},
+				module = state.shaders[.colored_triangle],
+				pName = "main",
+			},
+			{
+				sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+				stage = {.FRAGMENT},
+				module = state.shaders[.flat],
+				pName = "main",
+			},
 		}
+
+		pipeline := vk.GraphicsPipelineCreateInfo {
+			sType               = .GRAPHICS_PIPELINE_CREATE_INFO,
+			stageCount          = u32(len(stages)),
+			pStages             = raw_data(stages),
+			pVertexInputState   = &vk.PipelineVertexInputStateCreateInfo {
+				sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+			},
+			pInputAssemblyState = &vk.PipelineInputAssemblyStateCreateInfo {
+				sType = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+				topology = .TRIANGLE_LIST,
+			},
+			pViewportState      = &vk.PipelineViewportStateCreateInfo {
+				sType = .PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+				viewportCount = 1,
+				scissorCount = 1,
+			},
+			pRasterizationState = &vk.PipelineRasterizationStateCreateInfo {
+				sType       = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+				polygonMode = .FILL,
+				lineWidth   = 1,
+				// cullMode  = {.BACK},
+				frontFace   = .CLOCKWISE,
+			},
+			pMultisampleState   = &vk.PipelineMultisampleStateCreateInfo {
+				sType = .PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+				rasterizationSamples = {._1},
+				minSampleShading = 1,
+			},
+			pColorBlendState    = &vk.PipelineColorBlendStateCreateInfo {
+				sType = .PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+				logicOp = .COPY,
+				attachmentCount = 1,
+				pAttachments = &vk.PipelineColorBlendAttachmentState {
+					colorWriteMask = {.R, .G, .B, .A},
+				},
+			},
+			pDynamicState       = &vk.PipelineDynamicStateCreateInfo {
+				sType = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+				dynamicStateCount = u32(len(dynamic_states)),
+				pDynamicStates = raw_data(dynamic_states),
+			},
+			layout              = state.modes[.gfx].layout[0],
+			pNext               = &pipe_render,
+		}
+		must(
+			vk.CreateGraphicsPipelines(
+				state.device,
+				0,
+				1,
+				&pipeline,
+				nil,
+				&state.modes[.gfx].pipeline[0],
+			),
+		)
 	}
+	defer for modes in state.modes do for p in modes {
+		vk.DestroyPipelineLayout(state.device, p.layout, nil)
+		vk.DestroyPipeline(state.device, p.pipeline, nil)
+	}
+
 	imgui.CreateContext()
 	imvk.LoadFunctions(
 		vk.API_VERSION_1_3,
@@ -583,8 +690,6 @@ main :: proc() {
 				// depthAttachmentFormat:   Format,
 				// stencilAttachmentFormat: Format,
 			},
-
-			// Allocator: ^vk.AllocationCallbacks,
 			CheckVkResultFn = imguiCheckVkResult,
 			MinAllocationSize = 1024 * 1024, //vk.DeviceSize,          // Minimum allocation size. Set to 1024*1024 to satisfy zealous best practices validation layer and waste a little memory.
 		},
@@ -592,13 +697,15 @@ main :: proc() {
 	defer imvk.Shutdown()
 	imvk.CreateFontsTexture()
 	defer imvk.DestroyFontsTexture()
-	// imgui.sdl2
 
-	// mui.init(&state.mui_ctx)
 	defer vk.DeviceWaitIdle(state.device)
 
 	frame_num: u64 = 0
 	do_render: bool = true
+	current: Compute_Effect
+	compute_bound := i32(len(Compute_Effect))
+	// max_effects := compute_bound + i32(len(Gfx_Pipe)) - 1
+	// sel: Screen_Pipe
 	for {
 		e: sdl.Event
 		resize: bool
@@ -624,9 +731,29 @@ main :: proc() {
 			imvk.NewFrame()
 			imdl.NewFrame()
 			imgui.NewFrame()
-			imgui.ShowDemoWindow()
+
+			if imgui.Begin("background") {
+				name, _ := reflect.enum_name_from_value(current)
+				// if current < compute_bound {
+				// 	e := Compute_Effect(current)
+				// 	name, _ = reflect.enum_name_from_value(e)
+				// 	sel = e
+				// } else {
+				// 	e := Gfx_Pipe(current - compute_bound)
+				// 	sel = e
+				// 	name, _ = 
+				// }
+				imgui.Text(strings.clone_to_cstring(fmt.tprintf("Effect: %v", name)))
+				imgui.SliderInt("IDX", cast(^i32)&current, 0, compute_bound - 1)
+				imgui.InputFloat4("transform", &state.pushc.tr)
+				imgui.InputFloat4("camera", &state.pushc.cam)
+				imgui.InputFloat4("position", &state.pushc.pos)
+				imgui.InputFloat4("post-transform", &state.pushc.post)
+			}
+			imgui.End()
+			// imgui.ShowDemoWindow()
 			imgui.Render()
-			r := draw(frame_num)
+			r := draw(current, frame_num)
 			switch {
 			case r == .SUCCESS || r == .SUBOPTIMAL_KHR:
 			case r == .ERROR_OUT_OF_DATE_KHR:
@@ -701,7 +828,7 @@ create_image :: proc(info: ^vk.ImageCreateInfo, img: ^vk.Image) {
 	)
 }
 
-draw_background :: proc(buf: vk.CommandBuffer, img: vk.Image, n: u64) {
+draw_background :: proc(buf: vk.CommandBuffer, img: vk.Image, effect: Compute_Effect, n: u64) {
 	// cr := sub_range({.COLOR})
 	// vk.CmdClearColorImage(
 	// 	buf,
@@ -712,12 +839,28 @@ draw_background :: proc(buf: vk.CommandBuffer, img: vk.Image, n: u64) {
 	// 	&cr,
 	// )
 
-	grad := state.effects[.gradient]
-	vk.CmdBindPipeline(buf, .COMPUTE, grad.pipeline)
-	vk.CmdBindDescriptorSets(buf, .COMPUTE, grad.layout, 0, 1, &state.cds, 0, nil)
+	ef := &state.modes[.compute][effect]
+	vk.CmdBindPipeline(buf, .COMPUTE, ef.pipeline)
+	vk.CmdBindDescriptorSets(
+		buf,
+		.COMPUTE,
+		state.modes[.compute].layout[0],
+		0,
+		1,
+		&state.cds,
+		0,
+		nil,
+	)
 	state.pushc.tr = {0.0, 0.0, math.abs(math.sin(f32(n) / 120.0)), 1.0}
 	state.pushc.cam = {0.0, math.abs(math.cos(f32(n) / 120.0)), 0.0, 1.0}
-	vk.CmdPushConstants(buf, grad.layout, {.COMPUTE}, 0, size_of(state.pushc), &state.pushc)
+	vk.CmdPushConstants(
+		buf,
+		state.modes[.compute].layout[0],
+		{.COMPUTE},
+		0,
+		size_of(state.pushc),
+		&state.pushc,
+	)
 	vk.CmdDispatch(
 		buf,
 		u32(math.ceil(f32(state.drawimg.ext.width) / 16.0)),
@@ -779,7 +922,39 @@ imm_exec :: proc() {
 	must(vk.WaitForFences(state.device, 1, &state.imm.fences[0], true, max(u64)))
 }
 
-draw :: proc(n: u64) -> vk.Result {
+draw_geometry :: proc(buf: vk.CommandBuffer) {
+	mode := state.modes[.gfx][0]
+	vk.CmdBeginRendering(
+		buf,
+		&vk.RenderingInfo {
+			sType = .RENDERING_INFO,
+			renderArea = {extent = state.ext},
+			layerCount = 1,
+			// viewMask:             u32,
+			colorAttachmentCount = 1,
+			pColorAttachments = &vk.RenderingAttachmentInfo {
+				sType = .RENDERING_ATTACHMENT_INFO,
+				imageView = state.drawimg.view,
+				imageLayout = .COLOR_ATTACHMENT_OPTIMAL,
+				loadOp = .LOAD,
+				storeOp = .STORE,
+			},
+		},
+	)
+	vk.CmdBindPipeline(buf, .GRAPHICS, mode.pipeline)
+
+	vk.CmdSetViewport(
+		buf,
+		0,
+		1,
+		&vk.Viewport{width = f32(state.ext.width), height = f32(state.ext.height), maxDepth = 1},
+	)
+	vk.CmdSetScissor(buf, 0, 1, &vk.Rect2D{extent = state.ext})
+	vk.CmdDraw(buf, 3, 1, 0, 0)
+	vk.CmdEndRendering(buf)
+}
+
+draw :: proc(effect: Compute_Effect, n: u64) -> vk.Result {
 	fid := n % MAX_FRAMES_IN_FLIGHT
 	must(vk.WaitForFences(state.device, 1, &state.swapchain.fences[fid], true, max(u64)))
 	// must(vk.WaitForFences(state.device, 1, &f.fence, true, max(u64)))
@@ -812,8 +987,16 @@ draw :: proc(n: u64) -> vk.Result {
 
 	img := state.swapchain.images[image_index]
 	record(cmd, state.drawimg.buf, .UNDEFINED, .GENERAL)
-	draw_background(cmd, img, n)
+	draw_background(cmd, img, effect, n)
+	// switch pipe in effect {
+	// case Compute_Effect:
+	// case Gfx_Pipe:
+	// // draw_background(cmd, img, pipe, n)
+	// }
 
+	record(cmd, state.drawimg.buf, .GENERAL, .COLOR_ATTACHMENT_OPTIMAL)
+	draw_geometry(cmd)
+	record(cmd, state.drawimg.buf, .COLOR_ATTACHMENT_OPTIMAL, .GENERAL)
 	// record(cmd, state.drawimg.buf, .GENERAL, .TRANSFER_SRC_OPTIMAL)
 	record(cmd, img, .UNDEFINED, .TRANSFER_DST_OPTIMAL)
 	cpimg(
