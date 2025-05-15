@@ -4,15 +4,29 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(rgba16f, set = 0, binding = 0) uniform image2D image;
 
+layout(push_constant) uniform c {
+    vec4 tr;
+    vec4 cam;
+    vec4 pos;
+    vec4 post;
+};
+
 void main() {
     ivec2 uv = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(image);
 
+    vec4 top = tr;
+    vec4 bot = cam;
+
     if (uv.x > size.x || uv.y > size.y) return;
 
-    if (gl_LocalInvocationID.x != 0 && gl_LocalInvocationID.y != 0) {
-        imageStore(image, uv, vec4(float(uv.x) / size.x, float(uv.y) / size.y, 0., 1.));
-    } else {
-        imageStore(image, uv, vec4(vec3(0.), 1.));
-    }
+    float blend = float(uv.y) / size.y;
+
+    imageStore(image, uv, mix(top, bot, blend));
+
+    // if (gl_LocalInvocationID.x != 0 && gl_LocalInvocationID.y != 0) {
+    //     imageStore(image, uv, vec4(float(uv.x) / size.x, float(uv.y) / size.y, 0., 1.));
+    // } else {
+    //     imageStore(image, uv, vec4(vec3(0.), 1.));
+    // }
 }

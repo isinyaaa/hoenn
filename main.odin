@@ -4,6 +4,8 @@ import "base:runtime"
 import sa "core:container/small_array"
 import "core:log"
 import "core:math"
+import "core:math/linalg/glsl"
+import "core:reflect"
 import "core:slice"
 import "core:strings"
 
@@ -43,6 +45,7 @@ when ODIN_OS == .Darwin {
 ENABLE_VALIDATION_LAYERS :: #config(ENABLE_VALIDATION_LAYERS, ODIN_DEBUG)
 
 CSHADER :: #load("shaders/gradient.spv")
+SKYSHADER :: #load("shaders/sky.spv")
 
 INIT_RES :: [2]i32{1920, 1080}
 PROG :: "vk"
@@ -75,6 +78,18 @@ Re :: struct($N: int) where N >= 0 {
 	fences: [N]vk.Fence,
 }
 
+Effect_Type :: enum {
+	gradient,
+	sky,
+}
+
+Effect :: struct {
+	// name:     string,
+	shader:   vk.ShaderModule,
+	pipeline: vk.Pipeline,
+	layout:   vk.PipelineLayout,
+}
+
 state := struct {
 	// mui_ctx:         mui.Context,
 	window:          ^sdl.Window,
@@ -88,6 +103,12 @@ state := struct {
 	device:          vk.Device,
 	gfx:             VKQ,
 	imm:             Re(1),
+	pushc:           struct {
+		tr:   glsl.vec4,
+		cam:  glsl.vec4,
+		pos:  glsl.vec4,
+		post: glsl.vec4,
+	},
 	swapchain:       struct {
 		surf:         vk.SurfaceKHR,
 		chain:        vk.SwapchainKHR,
@@ -101,10 +122,10 @@ state := struct {
 	},
 	ext:             vk.Extent2D,
 	drawimg:         Image,
-	cshadem:         vk.ShaderModule,
+	effects:         [Effect_Type]Effect,
+	// cshadem:         vk.ShaderModule,
+	// skyshadem:       vk.ShaderModule,
 	cds:             vk.DescriptorSet,
-	cpipe:           vk.Pipeline,
-	cpLay:           vk.PipelineLayout,
 }{}
 
 Image :: struct {
@@ -458,65 +479,76 @@ main :: proc() {
 	}
 	// }
 
-	// shaders
-	{
-		state.cshadem = create_shader_module(CSHADER)
-		// state.shader_stages[0] = vk.PipelineShaderStageCreateInfo {
-		// 	sType  = .PIPELINE_SHADER_STAGE_CREATE_INFO,
-		// 	stage  = {.VERTEX},
-		// 	module = state.cshadem,
-		// 	pName  = "main",
-		// }
-
-		// state.frag_shader_module = create_shader_module(SHADER_FRAG)
-		// state.shader_stages[1] = vk.PipelineShaderStageCreateInfo {
-		// 	sType  = .PIPELINE_SHADER_STAGE_CREATE_INFO,
-		// 	stage  = {.FRAGMENT},
-		// 	module = state.frag_shader_module,
-		// 	pName  = "main",
-		// }
+	grad := create_shader_module(CSHADER)
+	sky := create_shader_module(SKYSHADER)
+	defer {
+		vk.DestroyShaderModule(state.device, grad, nil)
+		vk.DestroyShaderModule(state.device, sky, nil)
 	}
-	defer vk.DestroyShaderModule(state.device, state.cshadem, nil)
 	// defer vk.DestroyShaderModule(state.device, state.frag_shader_module, nil)
 
 	// pipeline
-	{
-		must(
-			vk.CreatePipelineLayout(
-				state.device,
-				&vk.PipelineLayoutCreateInfo {
-					sType = .PIPELINE_LAYOUT_CREATE_INFO,
-					setLayoutCount = 1,
-					pSetLayouts = &dsl,
+	layout: vk.PipelineLayout
+	must(
+		vk.CreatePipelineLayout(
+			state.device,
+			&vk.PipelineLayoutCreateInfo {
+				sType = .PIPELINE_LAYOUT_CREATE_INFO,
+				setLayoutCount = 1,
+				pSetLayouts = &dsl,
+				pushConstantRangeCount = 1,
+				pPushConstantRanges = &vk.PushConstantRange {
+					size = size_of(state.pushc),
+					stageFlags = {.COMPUTE},
 				},
-				nil,
-				&state.cpLay,
-			),
-		)
+			},
+			nil,
+			&layout,
+		),
+	)
 
-		must(
-			vk.CreateComputePipelines(
-				state.device,
-				{},
-				1,
-				&vk.ComputePipelineCreateInfo {
-					sType = .COMPUTE_PIPELINE_CREATE_INFO,
-					stage = vk.PipelineShaderStageCreateInfo {
-						sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
-						stage = {.COMPUTE},
-						module = state.cshadem,
-						pName = "main",
-					},
-					layout = state.cpLay,
-				},
-				nil,
-				&state.cpipe,
-			),
-		)
+	pipe_infos := []vk.ComputePipelineCreateInfo {
+		{
+			sType = .COMPUTE_PIPELINE_CREATE_INFO,
+			stage = vk.PipelineShaderStageCreateInfo {
+				sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+				stage = {.COMPUTE},
+				module = grad,
+				pName = "main",
+			},
+			layout = layout,
+		},
+		{
+			sType = .COMPUTE_PIPELINE_CREATE_INFO,
+			stage = vk.PipelineShaderStageCreateInfo {
+				sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+				stage = {.COMPUTE},
+				module = sky,
+				pName = "main",
+			},
+			layout = layout,
+		},
+	}
+	pipes: [2]vk.Pipeline
+	must(
+		vk.CreateComputePipelines(
+			state.device,
+			{},
+			u32(len(pipe_infos)),
+			raw_data(pipe_infos),
+			nil,
+			raw_data(pipes[:]),
+		),
+	)
+	state.effects = {
+		.gradient = {pipeline = pipes[0], shader = grad, layout = layout},
+		.sky = {pipeline = pipes[1], shader = sky, layout = layout},
 	}
 	defer {
-		vk.DestroyPipelineLayout(state.device, state.cpLay, nil)
-		vk.DestroyPipeline(state.device, state.cpipe, nil)
+		vk.DestroyPipelineLayout(state.device, layout, nil)
+		for p in pipes {
+			vk.DestroyPipeline(state.device, p, nil)
+		}
 	}
 	imgui.CreateContext()
 	imvk.LoadFunctions(
@@ -675,13 +707,17 @@ draw_background :: proc(buf: vk.CommandBuffer, img: vk.Image, n: u64) {
 	// 	buf,
 	// 	img,
 	// 	.GENERAL,
-	// 	&vk.ClearColorValue{float32 = {0.0, 0.0, math.abs(math.sin(f32(n) / 120.0)), 1.0}},
+	// 	&vk.ClearColorValue{float32 = },
 	// 	1,
 	// 	&cr,
 	// )
 
-	vk.CmdBindPipeline(buf, .COMPUTE, state.cpipe)
-	vk.CmdBindDescriptorSets(buf, .COMPUTE, state.cpLay, 0, 1, &state.cds, 0, nil)
+	grad := state.effects[.gradient]
+	vk.CmdBindPipeline(buf, .COMPUTE, grad.pipeline)
+	vk.CmdBindDescriptorSets(buf, .COMPUTE, grad.layout, 0, 1, &state.cds, 0, nil)
+	state.pushc.tr = {0.0, 0.0, math.abs(math.sin(f32(n) / 120.0)), 1.0}
+	state.pushc.cam = {0.0, math.abs(math.cos(f32(n) / 120.0)), 0.0, 1.0}
+	vk.CmdPushConstants(buf, grad.layout, {.COMPUTE}, 0, size_of(state.pushc), &state.pushc)
 	vk.CmdDispatch(
 		buf,
 		u32(math.ceil(f32(state.drawimg.ext.width) / 16.0)),
