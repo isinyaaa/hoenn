@@ -24,8 +24,6 @@ when ODIN_OS == .Darwin {
 	foreign import __ "system:System.framework"
 	DEVICE_EXTENSIONS := []cstring {
 		vk.KHR_SWAPCHAIN_EXTENSION_NAME,
-		// vk.EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
-		// vk.EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
 		vk.KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
 		vk.EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
 		vk.KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
@@ -68,7 +66,6 @@ PMODE: vk.PresentModeKHR = .FIFO
 MAX_FRAMES_IN_FLIGHT :: 2
 
 g_ctx: runtime.Context
-// g_framebuffer_resized: bool
 
 VKQ :: struct {
 	idx: u32,
@@ -98,13 +95,12 @@ Compute_Effect :: enum {
 	sky,
 }
 
-Gfx_Pipe :: enum {
-	triangle,
-}
-
-Screen_Pipe :: union {
-	Compute_Effect,
-	Gfx_Pipe,
+MeshBuffer :: struct {
+	indices:  vk.Buffer,
+	vertices: vk.Buffer,
+	idx_mem:  vk.DeviceMemory,
+	vtx_mem:  vk.DeviceMemory,
+	vtx_addr: vk.DeviceAddress,
 }
 
 Pipeline :: struct {
@@ -112,24 +108,31 @@ Pipeline :: struct {
 	layout:   vk.PipelineLayout,
 }
 
+Vertex :: struct #min_field_align (16) {
+	pos:    glsl.vec3,
+	color:  glsl.vec4,
+	normal: glsl.vec3,
+	uv:     glsl.vec2,
+}
+
 state := struct {
-	// mui_ctx:         mui.Context,
 	window:          ^sdl.Window,
-	// sdl_ctx:         struct {
-	//
-	//    },
-	// window:          glfw.WindowHandle,
 	instance:        vk.Instance,
 	physical_device: vk.PhysicalDevice,
 	mprop:           vk.PhysicalDeviceMemoryProperties,
 	device:          vk.Device,
 	gfx:             VKQ,
 	imm:             Re(1),
-	pushc:           struct {
+	compute_pushc:   struct {
 		tr:   glsl.vec4,
 		cam:  glsl.vec4,
 		pos:  glsl.vec4,
 		post: glsl.vec4,
+	},
+	geometry:        MeshBuffer,
+	gfx_pushc:       struct {
+		tr:        glsl.mat4,
+		vert_addr: vk.DeviceAddress,
 	},
 	swapchain:       struct {
 		surf:         vk.SurfaceKHR,
@@ -146,8 +149,6 @@ state := struct {
 	drawimg:         Image,
 	shaders:         [Shader_Type]vk.ShaderModule,
 	modes:           [Pipe_Type]#soa[2]Pipeline,
-	// cshadem:         vk.ShaderModule,
-	// skyshadem:       vk.ShaderModule,
 	cds:             vk.DescriptorSet,
 }{}
 
@@ -156,8 +157,8 @@ Image :: struct {
 	view: vk.ImageView,
 	ext:  vk.Extent3D,
 	fmt:  vk.Format,
-	addr: vk.DeviceMemory,
-	mem:  vk.MemoryRequirements,
+	mem:  vk.DeviceMemory,
+	// memreq: vk.MemoryRequirements,
 }
 
 
@@ -282,6 +283,11 @@ main :: proc() {
 						pNext = &vk.PhysicalDeviceDynamicRenderingFeatures {
 							sType = .PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
 							dynamicRendering = true,
+							pNext = &vk.PhysicalDeviceVulkan12Features {
+								sType = .PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+								bufferDeviceAddress = true,
+								descriptorIndexing = true,
+							},
 						},
 					},
 					pQueueCreateInfos = raw_data(sa.slice(&q_infos)),
@@ -325,33 +331,6 @@ main :: proc() {
 	state.swapchain.views = make([]vk.ImageView, state.swapchain.count)
 	state.swapchain.semas = make([]vk.Semaphore, state.swapchain.count)
 	state.swapchain.finis = make([]vk.Semaphore, state.swapchain.count)
-	{
-		// query supported formats
-		// formats: sa.Small_Array(N_FMTS, vk.SurfaceFormatKHR)
-		// count: u32 = N_FMTS
-		// must(
-		// 	vk.GetPhysicalDeviceSurfaceFormatsKHR(
-		// 		state.physical_device,
-		// 		state.swapchain.surf,
-		// 		&count,
-		// 		raw_data(formats.data[:]),
-		// 	),
-		// )
-		// formats.len = int(count)
-
-		// try to set mailbox refresh rate
-		// pModes: [7]vk.PresentModeKHR
-		// count: u32 = 7
-		// must(
-		// 	vk.GetPhysicalDeviceSurfacePresentModesKHR(
-		// 		state.physical_device,
-		// 		state.swapchain.surf,
-		// 		&count,
-		// 		raw_data(pModes[:]),
-		// 	),
-		// )
-		// for &p in pModes[:count] do if p == .MAILBOX do state.pmode = .MAILBOX
-	}
 
 	// descriptors
 	dpool: vk.DescriptorPool
@@ -359,7 +338,6 @@ main :: proc() {
 	{
 		maxSets :: 10
 		sizes := []vk.DescriptorPoolSize {
-			// {.STORAGE_IMAGE, maxSets},
 			{.SAMPLER, maxSets},
 			{.COMBINED_IMAGE_SAMPLER, maxSets},
 			{.SAMPLED_IMAGE, maxSets},
@@ -469,7 +447,6 @@ main :: proc() {
 		vk.DestroyCommandPool(state.device, state.swapchain.pool, nil)
 		vk.DestroyCommandPool(state.device, state.imm.pool, nil)
 	}
-	// sdl.ClaimWindowForGPUDevice()
 
 	// Set up sync primitives.
 	{
@@ -520,7 +497,7 @@ main :: proc() {
 				pSetLayouts = &dsl,
 				pushConstantRangeCount = 1,
 				pPushConstantRanges = &vk.PushConstantRange {
-					size = size_of(state.pushc),
+					size = size_of(state.compute_pushc),
 					stageFlags = {.COMPUTE},
 				},
 			},
@@ -563,7 +540,7 @@ main :: proc() {
 		),
 	)
 	log.debugf("%v", state.modes[.compute].pipeline[:])
-	color_attach_render := []vk.Format{.R16G16B16A16_SFLOAT}
+	color_attach_render := []vk.Format{state.drawimg.fmt}
 	pipe_render := vk.PipelineRenderingCreateInfo {
 		sType                   = .PIPELINE_RENDERING_CREATE_INFO_KHR,
 		// viewMask:                u32,
@@ -572,12 +549,23 @@ main :: proc() {
 		// depthAttachmentFormat:   Format,
 		// stencilAttachmentFormat: Format,
 	}
+
+	// gfx pipeline
 	{
 		dynamic_states := []vk.DynamicState{.VIEWPORT, .SCISSOR}
 		must(
 			vk.CreatePipelineLayout(
 				state.device,
-				&vk.PipelineLayoutCreateInfo{sType = .PIPELINE_LAYOUT_CREATE_INFO},
+				&vk.PipelineLayoutCreateInfo {
+					sType                  = .PIPELINE_LAYOUT_CREATE_INFO,
+					// setLayoutCount = 1,
+					// pSetLayouts = &dsl,
+					pushConstantRangeCount = 1,
+					pPushConstantRanges    = &vk.PushConstantRange {
+						size = size_of(state.gfx_pushc),
+						stageFlags = {.VERTEX},
+					},
+				},
 				nil,
 				&state.modes[.gfx].layout[0],
 			),
@@ -597,56 +585,55 @@ main :: proc() {
 			},
 		}
 
-		pipeline := vk.GraphicsPipelineCreateInfo {
-			sType               = .GRAPHICS_PIPELINE_CREATE_INFO,
-			stageCount          = u32(len(stages)),
-			pStages             = raw_data(stages),
-			pVertexInputState   = &vk.PipelineVertexInputStateCreateInfo {
-				sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-			},
-			pInputAssemblyState = &vk.PipelineInputAssemblyStateCreateInfo {
-				sType = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-				topology = .TRIANGLE_LIST,
-			},
-			pViewportState      = &vk.PipelineViewportStateCreateInfo {
-				sType = .PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-				viewportCount = 1,
-				scissorCount = 1,
-			},
-			pRasterizationState = &vk.PipelineRasterizationStateCreateInfo {
-				sType       = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-				polygonMode = .FILL,
-				lineWidth   = 1,
-				// cullMode  = {.BACK},
-				frontFace   = .CLOCKWISE,
-			},
-			pMultisampleState   = &vk.PipelineMultisampleStateCreateInfo {
-				sType = .PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-				rasterizationSamples = {._1},
-				minSampleShading = 1,
-			},
-			pColorBlendState    = &vk.PipelineColorBlendStateCreateInfo {
-				sType = .PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-				logicOp = .COPY,
-				attachmentCount = 1,
-				pAttachments = &vk.PipelineColorBlendAttachmentState {
-					colorWriteMask = {.R, .G, .B, .A},
-				},
-			},
-			pDynamicState       = &vk.PipelineDynamicStateCreateInfo {
-				sType = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-				dynamicStateCount = u32(len(dynamic_states)),
-				pDynamicStates = raw_data(dynamic_states),
-			},
-			layout              = state.modes[.gfx].layout[0],
-			pNext               = &pipe_render,
-		}
 		must(
 			vk.CreateGraphicsPipelines(
 				state.device,
 				0,
 				1,
-				&pipeline,
+				&vk.GraphicsPipelineCreateInfo {
+					sType               = .GRAPHICS_PIPELINE_CREATE_INFO,
+					stageCount          = u32(len(stages)),
+					pStages             = raw_data(stages),
+					pVertexInputState   = &vk.PipelineVertexInputStateCreateInfo {
+						sType = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+					},
+					pInputAssemblyState = &vk.PipelineInputAssemblyStateCreateInfo {
+						sType = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+						topology = .TRIANGLE_LIST,
+					},
+					pViewportState      = &vk.PipelineViewportStateCreateInfo {
+						sType = .PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+						viewportCount = 1,
+						scissorCount = 1,
+					},
+					pRasterizationState = &vk.PipelineRasterizationStateCreateInfo {
+						sType       = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+						polygonMode = .FILL,
+						lineWidth   = 1,
+						// cullMode  = {.BACK},
+						frontFace   = .CLOCKWISE,
+					},
+					pMultisampleState   = &vk.PipelineMultisampleStateCreateInfo {
+						sType = .PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+						rasterizationSamples = {._1},
+						minSampleShading = 1,
+					},
+					pColorBlendState    = &vk.PipelineColorBlendStateCreateInfo {
+						sType = .PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+						logicOp = .COPY,
+						attachmentCount = 1,
+						pAttachments = &vk.PipelineColorBlendAttachmentState {
+							colorWriteMask = {.R, .G, .B, .A},
+						},
+					},
+					pDynamicState       = &vk.PipelineDynamicStateCreateInfo {
+						sType = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+						dynamicStateCount = u32(len(dynamic_states)),
+						pDynamicStates = raw_data(dynamic_states),
+					},
+					layout              = state.modes[.gfx].layout[0],
+					pNext               = &pipe_render,
+				},
 				nil,
 				&state.modes[.gfx].pipeline[0],
 			),
@@ -657,6 +644,27 @@ main :: proc() {
 		vk.DestroyPipeline(state.device, p.pipeline, nil)
 	}
 
+	vertices := []Vertex {
+		{pos = {0.5, -0.5, 0}, color = {0, 0, 0, 1}},
+		{pos = {0.5, 0.5, 0}, color = {0.5, 0.5, 0.5, 1}},
+		{pos = {-0.5, -0.5, 0}, color = {1, 0, 0, 1}},
+		{pos = {-0.5, 0.5, 0}, color = {0, 1, 0, 1}},
+	}
+	log.debugf(
+		"%v %v %v %v",
+		offset_of(Vertex, pos),
+		offset_of(Vertex, color),
+		offset_of(Vertex, normal),
+		offset_of(Vertex, uv),
+	)
+	rect_indices := []u32{0, 1, 2, 2, 1, 3}
+	state.geometry = upload_mesh(rect_indices, vertices)
+	defer {
+		vk.DestroyBuffer(state.device, state.geometry.vertices, nil)
+		vk.FreeMemory(state.device, state.geometry.vtx_mem, nil)
+		vk.DestroyBuffer(state.device, state.geometry.indices, nil)
+		vk.FreeMemory(state.device, state.geometry.idx_mem, nil)
+	}
 	imgui.CreateContext()
 	imvk.LoadFunctions(
 		vk.API_VERSION_1_3,
@@ -745,10 +753,10 @@ main :: proc() {
 				// }
 				imgui.Text(strings.clone_to_cstring(fmt.tprintf("Effect: %v", name)))
 				imgui.SliderInt("IDX", cast(^i32)&current, 0, compute_bound - 1)
-				imgui.InputFloat4("transform", &state.pushc.tr)
-				imgui.InputFloat4("camera", &state.pushc.cam)
-				imgui.InputFloat4("position", &state.pushc.pos)
-				imgui.InputFloat4("post-transform", &state.pushc.post)
+				imgui.InputFloat4("transform", &state.compute_pushc.tr)
+				imgui.InputFloat4("camera", &state.compute_pushc.cam)
+				imgui.InputFloat4("position", &state.compute_pushc.pos)
+				imgui.InputFloat4("post-transform", &state.compute_pushc.post)
 			}
 			imgui.End()
 			// imgui.ShowDemoWindow()
@@ -767,13 +775,63 @@ main :: proc() {
 	}
 }
 
-create_shader_module :: proc(code: []byte) -> (module: vk.ShaderModule) {
-	as_u32 := slice.reinterpret([]u32, code)
+upload_mesh :: proc(indices: []u32, vertices: []Vertex) -> (m: MeshBuffer) {
+	vtxbuf_size := size_of(Vertex) * len(vertices)
+	m.vertices, m.vtx_mem = create_buffer(
+		vk.DeviceSize(vtxbuf_size),
+		{.TRANSFER_DST, .STORAGE_BUFFER, .SHADER_DEVICE_ADDRESS},
+	)
+	addr_info := vk.BufferDeviceAddressInfo {
+		sType  = .BUFFER_DEVICE_ADDRESS_INFO,
+		buffer = m.vertices,
+	}
+	m.vtx_addr = vk.GetBufferDeviceAddress(state.device, &addr_info)
 
+	idbuf_size := size_of(u32) * len(indices)
+	m.indices, m.idx_mem = create_buffer(vk.DeviceSize(idbuf_size), {.TRANSFER_DST, .INDEX_BUFFER})
+
+	total_size := vtxbuf_size + idbuf_size
+	staging, devmem := create_buffer(vk.DeviceSize(total_size), {.TRANSFER_SRC}, cpu_only = true)
+	addr_info.buffer = staging
+	defer vk.DestroyBuffer(state.device, staging, nil)
+	defer vk.FreeMemory(state.device, devmem, nil)
+
+	dest := map_memory(devmem, vk.DeviceSize(total_size))
+	assert(vtxbuf_size == copy(dest[:vtxbuf_size], slice.reinterpret([]byte, vertices)))
+	assert(idbuf_size == copy(dest[vtxbuf_size:], slice.reinterpret([]byte, indices)))
+	imm_exec(proc(cmd: vk.CommandBuffer, args: ..any) {
+			src, vtx, idx: vk.Buffer
+			offset, total: vk.DeviceSize
+			src, _ = args[0].(vk.Buffer)
+			log.debugf("%v", src)
+			vtx, _ = args[1].(vk.Buffer)
+			log.debugf("%v", vtx)
+			idx, _ = args[2].(vk.Buffer)
+			offset, _ = args[3].(vk.DeviceSize)
+			total, _ = args[4].(vk.DeviceSize)
+			vk.CmdCopyBuffer(cmd, src, vtx, 1, &vk.BufferCopy{size = offset})
+			vk.CmdCopyBuffer(
+				cmd,
+				src,
+				idx,
+				1,
+				&vk.BufferCopy{srcOffset = offset, size = total - offset},
+			)
+		}, staging, m.vertices, m.indices, vk.DeviceSize(vtxbuf_size), vk.DeviceSize(total_size))
+	return
+}
+
+map_memory :: proc(dm: vk.DeviceMemory, size: vk.DeviceSize) -> []byte {
+	d: rawptr
+	vk.MapMemory(state.device, dm, 0, size, {}, &d)
+	return slice.bytes_from_ptr(d, int(size))
+}
+
+create_shader_module :: proc(code: []byte) -> (module: vk.ShaderModule) {
 	create_info := vk.ShaderModuleCreateInfo {
 		sType    = .SHADER_MODULE_CREATE_INFO,
 		codeSize = len(code),
-		pCode    = raw_data(as_u32),
+		pCode    = raw_data(slice.reinterpret([]u32, code)),
 	}
 	must(vk.CreateShaderModule(state.device, &create_info, nil, &module))
 	return
@@ -791,18 +849,83 @@ mtype :: proc(properties: vk.MemoryPropertyFlags, requiredTypeBits: u32) -> u32 
 	return 0
 }
 
-create_image :: proc(info: ^vk.ImageCreateInfo, img: ^vk.Image) {
-	must(vk.CreateImage(state.device, info, nil, img))
+create_buffer :: proc(
+	size: vk.DeviceSize,
+	usage: vk.BufferUsageFlags,
+	cpu_only: bool = false,
+) -> (
+	buf: vk.Buffer,
+	addr: vk.DeviceMemory,
+) {
+	must(
+		vk.CreateBuffer(
+			state.device,
+			&vk.BufferCreateInfo {
+				sType = .BUFFER_CREATE_INFO,
+				// flags = {},
+				size  = size,
+				usage = usage,
+			},
+			nil,
+			&buf,
+		),
+	)
+
+	memReq := vk.MemoryRequirements2 {
+		sType = .MEMORY_REQUIREMENTS_2,
+	}
+	vk.GetBufferMemoryRequirements2(
+		state.device,
+		&vk.BufferMemoryRequirementsInfo2 {
+			sType = .BUFFER_MEMORY_REQUIREMENTS_INFO_2,
+			buffer = buf,
+		},
+		&memReq,
+	)
+	required := vk.MemoryPropertyFlags{.DEVICE_LOCAL, .HOST_COHERENT, .HOST_VISIBLE}
+	// if cpu_only do required |= {}
+	must(
+		vk.AllocateMemory(
+			state.device,
+			&vk.MemoryAllocateInfo {
+				sType = .MEMORY_ALLOCATE_INFO,
+				allocationSize = memReq.memoryRequirements.size,
+				memoryTypeIndex = mtype(required, memReq.memoryRequirements.memoryTypeBits),
+				pNext = &vk.MemoryAllocateFlagsInfo {
+					sType = .MEMORY_ALLOCATE_FLAGS_INFO,
+					flags = {.DEVICE_ADDRESS},
+				},
+			},
+			nil,
+			&addr,
+		),
+	)
+
+	must(
+		vk.BindBufferMemory2(
+			state.device,
+			1,
+			&vk.BindBufferMemoryInfo {
+				sType = .BIND_BUFFER_MEMORY_INFO,
+				buffer = buf,
+				memory = addr,
+			},
+		),
+	)
+	return
+}
+
+create_image :: proc(info: ^vk.ImageCreateInfo) -> (img: vk.Image, addr: vk.DeviceMemory) {
+	must(vk.CreateImage(state.device, info, nil, &img))
 
 	memReq := vk.MemoryRequirements2 {
 		sType = .MEMORY_REQUIREMENTS_2,
 	}
 	vk.GetImageMemoryRequirements2(
 		state.device,
-		&vk.ImageMemoryRequirementsInfo2{sType = .IMAGE_MEMORY_REQUIREMENTS_INFO_2, image = img^},
+		&vk.ImageMemoryRequirementsInfo2{sType = .IMAGE_MEMORY_REQUIREMENTS_INFO_2, image = img},
 		&memReq,
 	)
-	addr: vk.DeviceMemory
 	must(
 		vk.AllocateMemory(
 			state.device,
@@ -823,9 +946,10 @@ create_image :: proc(info: ^vk.ImageCreateInfo, img: ^vk.Image) {
 		vk.BindImageMemory2(
 			state.device,
 			1,
-			&vk.BindImageMemoryInfo{sType = .BIND_IMAGE_MEMORY_INFO, image = img^, memory = addr},
+			&vk.BindImageMemoryInfo{sType = .BIND_IMAGE_MEMORY_INFO, image = img, memory = addr},
 		),
 	)
+	return
 }
 
 draw_background :: proc(buf: vk.CommandBuffer, img: vk.Image, effect: Compute_Effect, n: u64) {
@@ -851,15 +975,15 @@ draw_background :: proc(buf: vk.CommandBuffer, img: vk.Image, effect: Compute_Ef
 		0,
 		nil,
 	)
-	state.pushc.tr = {0.0, 0.0, math.abs(math.sin(f32(n) / 120.0)), 1.0}
-	state.pushc.cam = {0.0, math.abs(math.cos(f32(n) / 120.0)), 0.0, 1.0}
+	state.compute_pushc.tr = {0.0, 0.0, math.abs(math.sin(f32(n) / 120.0)), 1.0}
+	state.compute_pushc.cam = {0.0, math.abs(math.cos(f32(n) / 120.0)), 0.0, 1.0}
 	vk.CmdPushConstants(
 		buf,
 		state.modes[.compute].layout[0],
 		{.COMPUTE},
 		0,
-		size_of(state.pushc),
-		&state.pushc,
+		size_of(state.compute_pushc),
+		&state.compute_pushc,
 	)
 	vk.CmdDispatch(
 		buf,
@@ -894,7 +1018,7 @@ draw_imgui :: proc(buf: vk.CommandBuffer, view: vk.ImageView) {
 	vk.CmdEndRendering(buf)
 }
 
-imm_exec :: proc() {
+imm_exec :: proc(f: proc(_: vk.CommandBuffer, _: ..any), args: ..any) {
 	must(vk.ResetFences(state.device, 1, &state.imm.fences[0]))
 
 	cmd := state.imm.bufs[0]
@@ -908,6 +1032,7 @@ imm_exec :: proc() {
 			},
 		),
 	)
+	f(cmd, ..args)
 	must(vk.EndCommandBuffer(cmd))
 
 	submit_info := vk.SubmitInfo2 {
@@ -942,7 +1067,6 @@ draw_geometry :: proc(buf: vk.CommandBuffer) {
 		},
 	)
 	vk.CmdBindPipeline(buf, .GRAPHICS, mode.pipeline)
-
 	vk.CmdSetViewport(
 		buf,
 		0,
@@ -950,7 +1074,20 @@ draw_geometry :: proc(buf: vk.CommandBuffer) {
 		&vk.Viewport{width = f32(state.ext.width), height = f32(state.ext.height), maxDepth = 1},
 	)
 	vk.CmdSetScissor(buf, 0, 1, &vk.Rect2D{extent = state.ext})
-	vk.CmdDraw(buf, 3, 1, 0, 0)
+
+	state.gfx_pushc.tr = glsl.mat4(1)
+	state.gfx_pushc.vert_addr = state.geometry.vtx_addr
+	vk.CmdPushConstants(
+		buf,
+		state.modes[.gfx].layout[0],
+		{.VERTEX},
+		0,
+		size_of(state.gfx_pushc),
+		&state.gfx_pushc,
+	)
+	vk.CmdBindIndexBuffer(buf, state.geometry.indices, 0, .UINT32)
+
+	vk.CmdDrawIndexed(buf, 6, 1, 0, 0, 0)
 	vk.CmdEndRendering(buf)
 }
 
@@ -1190,7 +1327,7 @@ create_swapchain :: proc() {
 	}
 	state.drawimg.fmt = .R16G16B16A16_SFLOAT
 
-	create_image(
+	state.drawimg.buf, state.drawimg.mem = create_image(
 		&vk.ImageCreateInfo {
 			sType       = .IMAGE_CREATE_INFO,
 			flags       = {},
@@ -1207,7 +1344,6 @@ create_swapchain :: proc() {
 			// pQueueFamilyIndices:   [^]u32,
 			// initialLayout = .,
 		},
-		&state.drawimg.buf,
 	)
 	must(
 		vk.CreateImageView(
@@ -1267,7 +1403,7 @@ destroy_swapchain :: proc() {
 	}
 	vk.DestroySwapchainKHR(state.device, state.swapchain.chain, nil)
 	vk.DestroyImage(state.device, state.drawimg.buf, nil)
-	vk.FreeMemory(state.device, state.drawimg.addr, nil)
+	vk.FreeMemory(state.device, state.drawimg.mem, nil)
 	vk.DestroyImageView(state.device, state.drawimg.view, nil)
 
 	// cleanup
