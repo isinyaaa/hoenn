@@ -58,26 +58,28 @@ INIT_RES :: [2]i32{1920, 1080}
 DRAW_RES :: [2]i32{3840, 2160}
 PROG :: "vk"
 
+// queue family limit
 N_QFAM :: 8
 Q_CAPS := []vk.QueueFlag{.GRAPHICS, .COMPUTE, .TRANSFER}
+// maximum supported queues
 N_Q :: 32
 
+// maximum device extensions to query
 N_EXTS :: 300
+// maximum surface formats to query
 N_FMTS :: 300
 
+// default surface format, should be widely supported
 SURF_FMT :: vk.SurfaceFormatKHR {
 	format     = .B8G8R8A8_UNORM,
 	colorSpace = .SRGB_NONLINEAR,
 }
+// default present mode
 PMODE: vk.PresentModeKHR = .FIFO
+// max frames to handle in app, most devices want at least 3 swapchain images
 MAX_FRAMES_IN_FLIGHT :: 2
 
 g_ctx: runtime.Context
-
-VKQ :: struct {
-	idx: u32,
-	q:   vk.Queue,
-}
 
 Re :: struct($N: int) where N >= 0 {
 	pool:   vk.CommandPool,
@@ -105,9 +107,10 @@ Compute_Effect :: enum {
 MeshBuffer :: struct {
 	indices:  vk.Buffer,
 	vertices: vk.Buffer,
+	vtx_addr: vk.DeviceAddress,
+	// kept for cleanup purposes
 	idx_mem:  vk.DeviceMemory,
 	vtx_mem:  vk.DeviceMemory,
-	vtx_addr: vk.DeviceAddress,
 }
 
 GeoSurface :: struct {
@@ -132,6 +135,7 @@ vec4 :: [4]f32
 
 mat4 :: matrix[4, 4]f32
 
+// alignment to match glsl uniform
 Vertex :: struct #min_field_align (16) {
 	pos:    vec3,
 	color:  vec4,
@@ -152,7 +156,11 @@ state := struct {
 	physical_device: vk.PhysicalDevice,
 	mprop:           vk.PhysicalDeviceMemoryProperties,
 	device:          vk.Device,
-	gfx:             VKQ,
+	gfx:             struct {
+		idx: u32,
+		q:   vk.Queue,
+	},
+	// immediate mode render data
 	imm:             Re(1),
 	compute_pushc:   struct {
 		tr:   vec4,
@@ -305,7 +313,6 @@ main :: proc() {
 			break
 		}
 
-		log.debugf("%v, %d", DEVICE_EXTENSIONS[:])
 		must(
 			vk.CreateDevice(
 				state.physical_device,
@@ -336,7 +343,6 @@ main :: proc() {
 			),
 		)
 		vk.GetDeviceQueue(state.device, q_infos.data[0].queueFamilyIndex, 0, &state.gfx.q)
-		// vk.GetDeviceQueue(state.device, indices.present.?, 0, &state.present_queue)
 	}
 	defer vk.DestroyDevice(state.device, nil)
 	vk.load_proc_addresses_device(state.device)
@@ -372,10 +378,11 @@ main :: proc() {
 	{
 		maxSets :: 10
 		sizes := []vk.DescriptorPoolSize {
+			{.STORAGE_IMAGE, maxSets},
+			// imgui resources
 			{.SAMPLER, maxSets},
 			{.COMBINED_IMAGE_SAMPLER, maxSets},
 			{.SAMPLED_IMAGE, maxSets},
-			{.STORAGE_IMAGE, maxSets},
 			{.UNIFORM_TEXEL_BUFFER, maxSets},
 			{.STORAGE_TEXEL_BUFFER, maxSets},
 			{.UNIFORM_BUFFER, maxSets},
@@ -405,7 +412,6 @@ main :: proc() {
 					sType = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
 					bindingCount = 1,
 					pBindings = &vk.DescriptorSetLayoutBinding {
-						binding = 0,
 						descriptorCount = 1,
 						stageFlags = {.COMPUTE},
 						descriptorType = .STORAGE_IMAGE,
@@ -480,7 +486,6 @@ main :: proc() {
 				&state.imm.bufs[0],
 			),
 		)
-		// [0] = bufs[0]
 	}
 	defer {
 		vk.DestroyCommandPool(state.device, state.swapchain.pool, nil)
@@ -578,7 +583,6 @@ main :: proc() {
 			raw_data(state.modes[.compute].pipeline[:]),
 		),
 	)
-	log.debugf("%v", state.modes[.compute].pipeline[:])
 	color_attach_render := []vk.Format{state.draw.fmt}
 	pipe_render := vk.PipelineRenderingCreateInfo {
 		sType                   = .PIPELINE_RENDERING_CREATE_INFO_KHR,
@@ -691,11 +695,6 @@ main :: proc() {
 						depthTestEnable = true,
 						depthWriteEnable = true,
 						depthCompareOp = .GREATER_OR_EQUAL,
-						front = {},
-						back = {},
-						depthBoundsTestEnable = false,
-						stencilTestEnable = false,
-						minDepthBounds = 0,
 						maxDepthBounds = 1,
 					},
 					pDynamicState       = &vk.PipelineDynamicStateCreateInfo {
@@ -722,22 +721,22 @@ main :: proc() {
 		{pos = {-0.5, -0.5, 0}, color = {1, 0, 0, 1}},
 		{pos = {-0.5, 0.5, 0}, color = {0, 1, 0, 1}},
 	}
-	log.debugf(
-		"%v %v %v %v",
-		offset_of(Vertex, pos),
-		offset_of(Vertex, color),
-		offset_of(Vertex, normal),
-		offset_of(Vertex, uv),
-	)
+	// log.debugf(
+	// 	"%v %v %v %v",
+	// 	offset_of(Vertex, pos),
+	// 	offset_of(Vertex, color),
+	// 	offset_of(Vertex, normal),
+	// 	offset_of(Vertex, uv),
+	// )
 	rect_indices := []u32{0, 1, 2, 2, 1, 3}
 	triangle := upload_mesh(rect_indices, vertices)
 	defer destroy_mesh(triangle)
 
-	meshes := load_gltf_meshes(GLB_PATH)
+	meshes := load_gltf_meshes(GLB_PATH, .glb, color_override = true)
 	state.geometry = {
 		.triangle = MeshAsset {
 			name = "triangle",
-			surfs = []GeoSurface{{start = 0, count = 6}},
+			surfs = []GeoSurface{{count = 6}},
 			buf = triangle,
 		},
 		.cube = meshes[0],
@@ -764,23 +763,19 @@ main :: proc() {
 			Device = state.device,
 			QueueFamily = state.gfx.idx,
 			Queue = state.gfx.q,
-			DescriptorPool = dpool, // See requirements in note above; ignored if using DescriptorPoolSize > 0
+			DescriptorPool = dpool,
 			MinImageCount = state.swapchain.count,
 			ImageCount = state.swapchain.count,
-			// MSAASamples: vk.SampleCountFlags, // 0 defaults to VK_SAMPLE_COUNT_1_BIT
-			// PipelineCache: vk.PipelineCache,
-			// Subpass: u32,
+			// MSAASamples = ._1,
 			UseDynamicRendering = true,
 			PipelineRenderingCreateInfo = {
-				sType                   = .PIPELINE_RENDERING_CREATE_INFO_KHR,
-				// viewMask:                u32,
-				colorAttachmentCount    = u32(len(color_attach)),
+				sType = .PIPELINE_RENDERING_CREATE_INFO_KHR,
+				colorAttachmentCount = u32(len(color_attach)),
 				pColorAttachmentFormats = raw_data(color_attach),
-				depthAttachmentFormat   = state.depth.fmt,
-				// stencilAttachmentFormat: Format,
+				depthAttachmentFormat = state.depth.fmt,
 			},
 			CheckVkResultFn = imguiCheckVkResult,
-			MinAllocationSize = 1024 * 1024, //vk.DeviceSize,          // Minimum allocation size. Set to 1024*1024 to satisfy zealous best practices validation layer and waste a little memory.
+			MinAllocationSize = 1024 * 1024,
 		},
 	)
 	defer imvk.Shutdown()
@@ -789,14 +784,13 @@ main :: proc() {
 
 	defer vk.DeviceWaitIdle(state.device)
 
-	frame_num: u64 = 0
+	frame_num: u64
 	do_render: bool = true
 	effect: Compute_Effect
 	compute_bound := i32(len(Compute_Effect))
 	geo_bound := i32(len(Geometry))
 	geometry: Geometry
-	// max_effects := compute_bound + i32(len(Gfx_Pipe)) - 1
-	// sel: Screen_Pipe
+	scale: f32 = 1
 	for {
 		e: sdl.Event
 		resize: bool
@@ -826,15 +820,6 @@ main :: proc() {
 			if imgui.Begin("background") {
 				efname, _ := reflect.enum_name_from_value(effect)
 				geoname, _ := reflect.enum_name_from_value(geometry)
-				// if effect < compute_bound {
-				// 	e := Compute_Effect(effect)
-				// 	name, _ = reflect.enum_name_from_value(e)
-				// 	sel = e
-				// } else {
-				// 	e := Gfx_Pipe(effect - compute_bound)
-				// 	sel = e
-				// 	name, _ = 
-				// }
 				imgui.Text(
 					strings.clone_to_cstring(
 						fmt.tprintf("Effect: %v\tGeometry: %v", efname, geoname),
@@ -842,15 +827,19 @@ main :: proc() {
 				)
 				imgui.SliderInt("FX", cast(^i32)&effect, 0, compute_bound - 1)
 				imgui.SliderInt("GEO", cast(^i32)&geometry, 0, geo_bound - 1)
+				imgui.SliderFloat("SCALE", cast(^f32)&scale, 0.3, 1)
 				imgui.InputFloat4("transform", &state.compute_pushc.tr)
 				imgui.InputFloat4("camera", &state.compute_pushc.cam)
 				imgui.InputFloat4("position", &state.compute_pushc.pos)
 				imgui.InputFloat4("post-transform", &state.compute_pushc.post)
 			}
 			imgui.End()
-			// imgui.ShowDemoWindow()
 			imgui.Render()
-			r := draw(geometry, effect, frame_num)
+			extent := vk.Extent2D {
+				width  = u32(f32(state.winext.width) * scale),
+				height = u32(f32(state.winext.height) * scale),
+			}
+			r := draw(geometry, effect, extent, frame_num)
 			switch {
 			case r == .SUCCESS || r == .SUBOPTIMAL_KHR:
 			case r == .ERROR_OUT_OF_DATE_KHR:
@@ -860,39 +849,20 @@ main :: proc() {
 			}
 
 			frame_num += 1
-			// return
 		}
 	}
 }
 
-// Vertex :: struct #min_field_align (16) {
-// 	position: Vec3,
-// 	texCoord: Vec2,
-// 	normal:   Vec3,
-// 	bones:    [4]u32,
-// 	weights:  Vec4,
-// }
-
-// Mesh :: struct {
-// 	name:         cstring,
-// 	vertices:     []Vertex,
-// 	indices:      []u32,
-// 	vertexOffset: u32,
-// 	indiceOffset: u32,
-// }
-
-// Model :: struct {
-// 	name:   cstring,
-// meshes: []MeshAsset,
-// skeleton:   Skeleton,
-// animations: []Animation,
-// }
-
-load_gltf_meshes :: proc(path: string) -> (meshes: []MeshAsset) {
+load_gltf_meshes :: proc(
+	path: string,
+	ftype: gltf.file_type,
+	color_override: bool = false,
+) -> (
+	meshes: []MeshAsset,
+) {
 	opts := gltf.options {
-		type = .glb,
+		type = ftype,
 	}
-	// gltf.parse_file()
 	file, r := gltf.parse_file(opts, strings.clone_to_cstring(path))
 	defer gltf.free(file)
 	assert(r == .success, "gltf: could not parse file")
@@ -907,11 +877,8 @@ load_gltf_meshes :: proc(path: string) -> (meshes: []MeshAsset) {
 		}
 		src := rawptr(uintptr(data) + uintptr(bufferView.offset))
 		size := int(bufferView.size)
-		// log.debugf("copying with %v %v %v", dst, src, size)
 		mem.copy(dst, src, size)
 	}
-
-	// model.name = fmt.caprint(file.meshes[0].name)
 
 	meshes = make([]MeshAsset, len(file.meshes))
 
@@ -931,32 +898,25 @@ load_gltf_meshes :: proc(path: string) -> (meshes: []MeshAsset) {
 				count = u32(p.indices.count),
 			}
 			append(&surfs, surf)
-			// log.debug("new triangle")
 
 			resize(&idxs, int(surf.count))
 			idxs := idxs[ioff:]
 			ioff += surf.count
 
-			// mesh.indices = make([]u32, int(p.indices.count))
-
 			if p.indices.component_type == .r_32u {
-				log.debug("x")
 				copyData(p.indices, raw_data(idxs))
 			} else if p.indices.component_type == .r_16u {
-				// log.debug("y")
 				data := make([]u16, int(p.indices.count))
 				defer delete(data)
 				copyData(p.indices, raw_data(data))
 				for v, i in data do idxs[i] = u32(v)
 			} else if p.indices.component_type == .r_8u {
-				log.debug("z")
 				data := make([]u8, int(p.indices.count))
 				defer delete(data)
 				copyData(p.indices, raw_data(data))
 				for v, i in data do idxs[i] = u32(v)
 			}
 			resize(&vtxs, p.attributes[0].data.count)
-			// log.debugf("%v %v", len(p.attributes), p.attributes)
 			vtxs := vtxs[voff:]
 			voff += u32(p.attributes[0].data.count)
 
@@ -977,11 +937,10 @@ load_gltf_meshes :: proc(path: string) -> (meshes: []MeshAsset) {
 				}
 			}
 		}
-		// log.debugf("%v", vtxs.color)
 		verts := make([]Vertex, len(vtxs))
 		for v, i in vtxs {
 			verts[i] = v
-			verts[i].color = vec4{v.normal.x, v.normal.y, v.normal.z, 1.0}
+			if color_override do verts[i].color = vec4{v.normal.x, v.normal.y, v.normal.z, 1.0}
 		}
 		name := strings.clone_from_cstring(mesh.name)
 		if len(idxs) == 0 {
@@ -991,8 +950,8 @@ load_gltf_meshes :: proc(path: string) -> (meshes: []MeshAsset) {
 			log.debugf("skipping mesh %v with 0 vertices and surfs %v", name, surfs)
 			continue
 		}
-		// log.debugf("allocating mesh %v: %v %v", name, idxs, verts)
-		meshes[m] = MeshAsset {
+		log.infof("allocating mesh %v with %v verts and %v indices", name, len(idxs), len(verts))
+		meshes[m] = {
 			name  = name,
 			surfs = surfs[:],
 			buf   = upload_mesh(idxs[:], verts),
@@ -1007,45 +966,6 @@ destroy_mesh :: proc(mesh: MeshBuffer) {
 	vk.DestroyBuffer(state.device, mesh.indices, nil)
 	vk.FreeMemory(state.device, mesh.idx_mem, nil)
 }
-
-// 	scene := &scenes[sceneIndex]
-//
-// 	modelOffset := len(scene.models)
-// 	resize(&scene.models, modelOffset + len(modelPaths))
-//
-// 	for path, index in modelPaths {
-// 		modelIndex := modelOffset + index
-//
-// 		switch ext := filepath.ext(string(path))[1:]; ext {
-// 		case "obj":
-// 			fallthrough
-// 		case "fbx":
-// 			loadFBX(
-// 				path,
-// 				&scene.models[modelIndex],
-// 				u32(len(scene.vertices)),
-// 				u32(len(scene.indices)),
-// 			)
-// 		case "gltf":
-// 			fallthrough
-// 		case "glb":
-// 			loadGLTF(
-// 				path,
-// 				&scene.models[modelIndex],
-// 				u32(len(scene.vertices)),
-// 				u32(len(scene.indices)),
-// 			)
-// 		case:
-// 			log.log(.Warning, "File formate not supported! {}", ext)
-// 		}
-//
-// 		for &mesh in scene.models[modelIndex].meshes {
-// 			append(&scene.vertices, ..mesh.vertices)
-// 			append(&scene.indices, ..mesh.indices)
-// 		}
-// 	}
-// 	return
-// }
 
 upload_mesh :: proc(indices: []u32, vertices: []Vertex) -> (m: MeshBuffer) {
 	vtxbuf_size := size_of(Vertex) * len(vertices)
@@ -1071,14 +991,11 @@ upload_mesh :: proc(indices: []u32, vertices: []Vertex) -> (m: MeshBuffer) {
 	dest := map_memory(devmem, vk.DeviceSize(total_size))
 	assert(vtxbuf_size == copy(dest[:vtxbuf_size], slice.reinterpret([]byte, vertices)))
 	assert(idbuf_size == copy(dest[vtxbuf_size:], slice.reinterpret([]byte, indices)))
-	imm_exec(
-		proc(cmd: vk.CommandBuffer, args: ..any) {
+	imm_exec(proc(cmd: vk.CommandBuffer, args: ..any) {
 			src, vtx, idx: vk.Buffer
 			offset, total: vk.DeviceSize
 			src, _ = args[0].(vk.Buffer)
-			// log.debugf("%v", src)
 			vtx, _ = args[1].(vk.Buffer)
-			// log.debugf("%v", vtx)
 			idx, _ = args[2].(vk.Buffer)
 			offset, _ = args[3].(vk.DeviceSize)
 			total, _ = args[4].(vk.DeviceSize)
@@ -1090,13 +1007,7 @@ upload_mesh :: proc(indices: []u32, vertices: []Vertex) -> (m: MeshBuffer) {
 				1,
 				&vk.BufferCopy{srcOffset = offset, size = total - offset},
 			)
-		},
-		staging,
-		m.vertices,
-		m.indices,
-		vk.DeviceSize(vtxbuf_size),
-		vk.DeviceSize(total_size),
-	)
+		}, staging, m.vertices, m.indices, vk.DeviceSize(vtxbuf_size), vk.DeviceSize(total_size))
 	return
 }
 
@@ -1139,12 +1050,7 @@ create_buffer :: proc(
 	must(
 		vk.CreateBuffer(
 			state.device,
-			&vk.BufferCreateInfo {
-				sType = .BUFFER_CREATE_INFO,
-				// flags = {},
-				size  = size,
-				usage = usage,
-			},
+			&vk.BufferCreateInfo{sType = .BUFFER_CREATE_INFO, size = size, usage = usage},
 			nil,
 			&buf,
 		),
@@ -1161,8 +1067,8 @@ create_buffer :: proc(
 		},
 		&memReq,
 	)
-	required := vk.MemoryPropertyFlags{.DEVICE_LOCAL, .HOST_COHERENT, .HOST_VISIBLE}
-	// if cpu_only do required |= {}
+	required := vk.MemoryPropertyFlags{.HOST_COHERENT, .HOST_VISIBLE}
+	if cpu_only do required |= {.DEVICE_LOCAL}
 	must(
 		vk.AllocateMemory(
 			state.device,
@@ -1231,17 +1137,13 @@ create_image :: proc(info: ^vk.ImageCreateInfo) -> (img: vk.Image, addr: vk.Devi
 	return
 }
 
-draw_background :: proc(buf: vk.CommandBuffer, img: vk.Image, effect: Compute_Effect, n: u64) {
-	// cr := sub_range({.COLOR})
-	// vk.CmdClearColorImage(
-	// 	buf,
-	// 	img,
-	// 	.GENERAL,
-	// 	&vk.ClearColorValue{float32 = },
-	// 	1,
-	// 	&cr,
-	// )
-
+draw_background :: proc(
+	buf: vk.CommandBuffer,
+	img: vk.Image,
+	extent: vk.Extent2D,
+	effect: Compute_Effect,
+	n: u64,
+) {
 	ef := &state.modes[.compute][effect]
 	vk.CmdBindPipeline(buf, .COMPUTE, ef.pipeline)
 	vk.CmdBindDescriptorSets(
@@ -1266,21 +1168,19 @@ draw_background :: proc(buf: vk.CommandBuffer, img: vk.Image, effect: Compute_Ef
 	)
 	vk.CmdDispatch(
 		buf,
-		u32(math.ceil(f32(state.winext.width) / 16.0)),
-		u32(math.ceil(f32(state.winext.height) / 16.0)),
+		u32(math.ceil(f32(extent.width) / 16.0)),
+		u32(math.ceil(f32(extent.height) / 16.0)),
 		1,
 	)
 }
 
-draw_imgui :: proc(buf: vk.CommandBuffer, view: vk.ImageView) {
+draw_imgui :: proc(buf: vk.CommandBuffer, view: vk.ImageView, extent: vk.Extent2D) {
 	vk.CmdBeginRendering(
 		buf,
 		&vk.RenderingInfo {
 			sType = .RENDERING_INFO,
-			// flags = vk.RenderingFlags,
-			renderArea = {extent = state.winext},
+			renderArea = {extent = extent},
 			layerCount = 1,
-			// viewMask:             u32,
 			colorAttachmentCount = 1,
 			pColorAttachments = &vk.RenderingAttachmentInfo {
 				sType = .RENDERING_ATTACHMENT_INFO,
@@ -1289,8 +1189,6 @@ draw_imgui :: proc(buf: vk.CommandBuffer, view: vk.ImageView) {
 				loadOp = .LOAD,
 				storeOp = .STORE,
 			},
-			// pDepthAttachment = ^vk.RenderingAttachmentInfo,
-			// pStencilAttachment:   ^RenderingAttachmentInfo,
 		},
 	)
 	imvk.RenderDrawData(imgui.GetDrawData(), buf)
@@ -1326,15 +1224,14 @@ imm_exec :: proc(f: proc(_: vk.CommandBuffer, _: ..any), args: ..any) {
 	must(vk.WaitForFences(state.device, 1, &state.imm.fences[0], true, max(u64)))
 }
 
-draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer) {
+draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer, extent: vk.Extent2D) {
 	mode := state.modes[.gfx][0]
 	vk.CmdBeginRendering(
 		buf,
 		&vk.RenderingInfo {
 			sType = .RENDERING_INFO,
-			renderArea = {extent = state.winext},
+			renderArea = {extent = extent},
 			layerCount = 1,
-			// viewMask:             u32,
 			colorAttachmentCount = 1,
 			pColorAttachments = &vk.RenderingAttachmentInfo {
 				sType = .RENDERING_ATTACHMENT_INFO,
@@ -1347,12 +1244,8 @@ draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer) {
 				sType = .RENDERING_ATTACHMENT_INFO,
 				imageView = state.depth.view,
 				imageLayout = .DEPTH_ATTACHMENT_OPTIMAL,
-				// resolveMode:        ResolveModeFlags,
-				// resolveImageView:   ImageView,
-				// resolveImageLayout: ImageLayout,
 				loadOp = .CLEAR,
 				storeOp = .STORE,
-				clearValue = {depthStencil = {depth = 0}},
 			},
 		},
 	)
@@ -1361,17 +1254,13 @@ draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer) {
 		buf,
 		0,
 		1,
-		&vk.Viewport {
-			width = f32(state.winext.width),
-			height = f32(state.winext.height),
-			maxDepth = 1,
-		},
+		&vk.Viewport{width = f32(extent.width), height = f32(extent.height), maxDepth = 1},
 	)
-	vk.CmdSetScissor(buf, 0, 1, &vk.Rect2D{extent = state.winext})
+	vk.CmdSetScissor(buf, 0, 1, &vk.Rect2D{extent = extent})
 
 	perp := linalg.matrix4_perspective(
 		math.PI / 2.0,
-		f32(state.winext.width) / f32(state.winext.height),
+		f32(extent.width) / f32(extent.height),
 		0.1,
 		100,
 		flip_z_axis = true,
@@ -1394,12 +1283,15 @@ draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer) {
 	vk.CmdEndRendering(buf)
 }
 
-draw :: proc(geometry: Geometry, effect: Compute_Effect, n: u64) -> vk.Result {
+draw :: proc(
+	geometry: Geometry,
+	effect: Compute_Effect,
+	extent: vk.Extent2D,
+	n: u64,
+) -> vk.Result {
 	fid := n % MAX_FRAMES_IN_FLIGHT
 	must(vk.WaitForFences(state.device, 1, &state.swapchain.fences[fid], true, max(u64)))
-	// must(vk.WaitForFences(state.device, 1, &f.fence, true, max(u64)))
 
-	// Acquire an image from the swapchain.
 	image_index: u32
 	if r := vk.AcquireNextImageKHR(
 		state.device,
@@ -1427,18 +1319,18 @@ draw :: proc(geometry: Geometry, effect: Compute_Effect, n: u64) -> vk.Result {
 
 	img := state.swapchain.images[image_index]
 	record(cmd, state.draw.img, .UNDEFINED, .GENERAL)
-	draw_background(cmd, img, effect, n)
+	draw_background(cmd, img, extent, effect, n)
 
 	record(cmd, state.draw.img, .GENERAL, .COLOR_ATTACHMENT_OPTIMAL)
 	record(cmd, state.depth.img, .UNDEFINED, .DEPTH_ATTACHMENT_OPTIMAL)
-	draw_geometry(geometry, cmd)
+	draw_geometry(geometry, cmd, extent)
 
 	record(cmd, state.draw.img, .COLOR_ATTACHMENT_OPTIMAL, .TRANSFER_SRC_OPTIMAL)
 	record(cmd, img, .UNDEFINED, .TRANSFER_DST_OPTIMAL)
-	cpimg(cmd, state.draw.img, img, state.winext, state.winext)
+	cpimg(cmd, state.draw.img, img, extent, state.winext)
 
 	record(cmd, img, .TRANSFER_DST_OPTIMAL, .COLOR_ATTACHMENT_OPTIMAL)
-	draw_imgui(cmd, state.swapchain.views[image_index])
+	draw_imgui(cmd, state.swapchain.views[image_index], extent)
 
 	record(cmd, img, .COLOR_ATTACHMENT_OPTIMAL, .PRESENT_SRC_KHR)
 
@@ -1460,7 +1352,6 @@ draw :: proc(geometry: Geometry, effect: Compute_Effect, n: u64) -> vk.Result {
 	}
 	must(vk.QueueSubmit2(state.gfx.q, 1, &submit_info, state.swapchain.fences[fid]))
 
-	// Present.
 	present_info := vk.PresentInfoKHR {
 		sType              = .PRESENT_INFO_KHR,
 		// pNext              = &vk.SwapchainPresentFenceInfoEXT {
@@ -1558,7 +1449,6 @@ create_drawsurf :: proc(ext: vk.Extent2D) {
 	state.draw.img, state.draw.mem = create_image(
 		&vk.ImageCreateInfo {
 			sType = .IMAGE_CREATE_INFO,
-			flags = {},
 			imageType = .D2,
 			format = state.draw.fmt,
 			extent = ext3,
@@ -1605,7 +1495,6 @@ create_drawsurf :: proc(ext: vk.Extent2D) {
 	state.depth.img, state.depth.mem = create_image(
 		&vk.ImageCreateInfo {
 			sType = .IMAGE_CREATE_INFO,
-			flags = {},
 			imageType = .D2,
 			format = state.depth.fmt,
 			extent = ext3,
@@ -1694,14 +1583,14 @@ create_swapchain :: proc() {
 		),
 	)
 
+	create_info := vk.ImageViewCreateInfo {
+		sType            = .IMAGE_VIEW_CREATE_INFO,
+		viewType         = .D2,
+		format           = SURF_FMT.format,
+		subresourceRange = sub_range({.COLOR}),
+	}
 	for image, i in state.swapchain.images {
-		create_info := vk.ImageViewCreateInfo {
-			sType            = .IMAGE_VIEW_CREATE_INFO,
-			image            = image,
-			viewType         = .D2,
-			format           = SURF_FMT.format,
-			subresourceRange = sub_range({.COLOR}),
-		}
+		create_info.image = image
 		must(vk.CreateImageView(state.device, &create_info, nil, &state.swapchain.views[i]))
 	}
 }
@@ -1736,7 +1625,7 @@ pick_physical_device :: proc() -> vk.Result {
 
 	qfams: sa.Small_Array(N_QFAM, vk.QueueFamilyProperties)
 
-	best_device_score: u64 = 0
+	best_device_score: u64
 	devloop: for device in sa.slice(&phys) {
 		vk.GetPhysicalDeviceProperties(device, &props)
 
