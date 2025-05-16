@@ -30,6 +30,7 @@ when ODIN_OS == .Darwin {
 		vk.EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
 		vk.KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
 		vk.KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+		vk.EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
 	}
 } else {
 	DEVICE_EXTENSIONS := []cstring {
@@ -39,6 +40,7 @@ when ODIN_OS == .Darwin {
 		vk.EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
 		vk.KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
 		vk.KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+		vk.EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
 	}
 }
 
@@ -81,10 +83,19 @@ MAX_FRAMES_IN_FLIGHT :: 2
 
 g_ctx: runtime.Context
 
-Re :: struct($N: int) where N >= 0 {
+Frame :: struct {
+	cmd:   vk.CommandBuffer,
+	fence: vk.Fence,
+}
+
+Sync :: struct {
+	swapsema:   vk.Semaphore,
+	rendersema: vk.Semaphore,
+}
+
+RenderData :: struct($N: int) where N >= 0 {
 	pool:   vk.CommandPool,
-	bufs:   [N]vk.CommandBuffer,
-	fences: [N]vk.Fence,
+	frames: [N]Frame,
 }
 
 Shader_Type :: enum {
@@ -151,46 +162,45 @@ Geometry :: enum {
 }
 
 state := struct {
+	phy:             struct {
+		instance: vk.Instance,
+		device:   vk.PhysicalDevice,
+		surf:     vk.SurfaceKHR,
+		caps:     vk.SurfaceCapabilitiesKHR,
+		mem:      vk.PhysicalDeviceMemoryProperties,
+	},
 	window:          ^sdl.Window,
-	instance:        vk.Instance,
-	physical_device: vk.PhysicalDevice,
-	mprop:           vk.PhysicalDeviceMemoryProperties,
 	device:          vk.Device,
 	gfx:             struct {
 		idx: u32,
 		q:   vk.Queue,
 	},
-	// immediate mode render data
-	imm:             Re(1),
-	compute_pushc:   struct {
-		tr:   vec4,
-		cam:  vec4,
-		pos:  vec4,
-		post: vec4,
-	},
-	geometry:        [Geometry]MeshAsset,
-	gfx_pushc:       struct {
-		tr:        mat4,
-		vert_addr: vk.DeviceAddress,
+	// immediate mode
+	imm:             RenderData(1),
+	// dynamic render mode
+	using dyn:       struct {
+		render:        RenderData(MAX_FRAMES_IN_FLIGHT),
+		sync:          [MAX_FRAMES_IN_FLIGHT]Sync,
+		compute_pushc: struct {
+			tr, cam, pos, post: vec4,
+		},
+		gfx_pushc:     struct {
+			tr:        mat4,
+			vert_addr: vk.DeviceAddress,
+		},
+		geometry:      [Geometry]MeshAsset,
+		draw, depth:   Image,
+		shaders:       [Shader_Type]vk.ShaderModule,
+		modes:         [Pipe_Type]#soa[2]Pipeline,
 	},
 	swapchain:       struct {
-		surf:         vk.SurfaceKHR,
-		chain:        vk.SwapchainKHR,
-		caps:         vk.SurfaceCapabilitiesKHR,
-		ext:          vk.Extent2D,
-		using frames: Re(MAX_FRAMES_IN_FLIGHT),
-		count:        u32,
-		semas:        []vk.Semaphore,
-		finis:        []vk.Semaphore,
-		images:       []vk.Image,
-		views:        []vk.ImageView,
+		chain:  vk.SwapchainKHR,
+		ext:    vk.Extent2D,
+		count:  u32,
+		images: []vk.Image,
+		views:  []vk.ImageView,
 	},
-	winext:          vk.Extent2D,
-	drawext:         vk.Extent2D,
-	draw:            Image,
-	depth:           Image,
-	shaders:         [Shader_Type]vk.ShaderModule,
-	modes:           [Pipe_Type]#soa[2]Pipeline,
+	winext, drawext: vk.Extent2D,
 	cds:             vk.DescriptorSet,
 }{}
 
@@ -252,12 +262,7 @@ main :: proc() {
 			dbg_create_info := vk.DebugUtilsMessengerCreateInfoEXT {
 				sType           = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
 				messageSeverity = severity,
-				messageType     = {
-					.GENERAL,
-					.VALIDATION,
-					.PERFORMANCE,
-					// .DEVICE_ADDRESS_BINDING,
-				}, // all of them.
+				messageType     = {.GENERAL, .VALIDATION, .PERFORMANCE, .DEVICE_ADDRESS_BINDING},
 				pfnUserCallback = vk_messenger_callback,
 			}
 			create_info.pNext = &dbg_create_info
@@ -266,26 +271,26 @@ main :: proc() {
 		create_info.enabledExtensionCount = u32(len(extensions))
 		create_info.ppEnabledExtensionNames = raw_data(extensions)
 
-		must(vk.CreateInstance(&create_info, nil, &state.instance))
+		must(vk.CreateInstance(&create_info, nil, &state.phy.instance))
 	}
-	defer vk.DestroyInstance(state.instance, nil)
-	vk.load_proc_addresses_instance(state.instance)
+	defer vk.DestroyInstance(state.phy.instance, nil)
+	vk.load_proc_addresses_instance(state.phy.instance)
 
 	when ENABLE_VALIDATION_LAYERS {
 		dbg_messenger: vk.DebugUtilsMessengerEXT
 		must(
 			vk.CreateDebugUtilsMessengerEXT(
-				state.instance,
+				state.phy.instance,
 				transmute(^vk.DebugUtilsMessengerCreateInfoEXT)create_info.pNext,
 				nil,
 				&dbg_messenger,
 			),
 		)
-		defer vk.DestroyDebugUtilsMessengerEXT(state.instance, dbg_messenger, nil)
+		defer vk.DestroyDebugUtilsMessengerEXT(state.phy.instance, dbg_messenger, nil)
 	}
 
 	must(pick_physical_device())
-	vk.GetPhysicalDeviceMemoryProperties(state.physical_device, &state.mprop)
+	vk.GetPhysicalDeviceMemoryProperties(state.phy.device, &state.phy.mem)
 
 	// gather all queues that support gfx
 	// TODO: gfx and present queues might be different in hybrid GPU systems, lol whatever man
@@ -294,7 +299,7 @@ main :: proc() {
 		count: u32 = N_QFAM
 		qfams: sa.Small_Array(N_QFAM, vk.QueueFamilyProperties)
 		vk.GetPhysicalDeviceQueueFamilyProperties(
-			state.physical_device,
+			state.phy.device,
 			&count,
 			raw_data(qfams.data[:]),
 		)
@@ -315,7 +320,7 @@ main :: proc() {
 
 		must(
 			vk.CreateDevice(
-				state.physical_device,
+				state.phy.device,
 				&vk.DeviceCreateInfo {
 					sType = .DEVICE_CREATE_INFO,
 					pNext = &vk.PhysicalDeviceSynchronization2Features {
@@ -348,29 +353,27 @@ main :: proc() {
 	vk.load_proc_addresses_device(state.device)
 
 	assert(
-		sdl.Vulkan_CreateSurface(state.window, state.instance, nil, &state.swapchain.surf),
+		sdl.Vulkan_CreateSurface(state.window, state.phy.instance, nil, &state.phy.surf),
 		"could not create surface",
 	)
-	defer vk.DestroySurfaceKHR(state.instance, state.swapchain.surf, nil)
+	defer vk.DestroySurfaceKHR(state.phy.instance, state.phy.surf, nil)
 
 	// NOTE: looks like a wrong binding with the third arg being a multipointer.
 	must(
 		vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(
-			state.physical_device,
-			state.swapchain.surf,
-			&state.swapchain.caps,
+			state.phy.device,
+			state.phy.surf,
+			&state.phy.caps,
 		),
 	)
-	count := state.swapchain.caps.minImageCount + 1
-	if state.swapchain.caps.maxImageCount > 0 {
-		count = min(count, state.swapchain.caps.maxImageCount)
+	count := state.phy.caps.minImageCount + 1
+	if state.phy.caps.maxImageCount > 0 {
+		count = min(count, state.phy.caps.maxImageCount)
 	}
 	assert(count > 0, "no swapchain")
 	state.swapchain.count = count
 	state.swapchain.images = make([]vk.Image, state.swapchain.count)
 	state.swapchain.views = make([]vk.ImageView, state.swapchain.count)
-	state.swapchain.semas = make([]vk.Semaphore, state.swapchain.count)
-	state.swapchain.finis = make([]vk.Semaphore, state.swapchain.count)
 
 	// descriptors
 	dpool: vk.DescriptorPool
@@ -455,7 +458,7 @@ main :: proc() {
 			flags            = {.RESET_COMMAND_BUFFER},
 			queueFamilyIndex = state.gfx.idx,
 		}
-		must(vk.CreateCommandPool(state.device, &pool_info, nil, &state.swapchain.pool))
+		must(vk.CreateCommandPool(state.device, &pool_info, nil, &state.render.pool))
 		must(vk.CreateCommandPool(state.device, &pool_info, nil, &state.imm.pool))
 
 		bufs: [MAX_FRAMES_IN_FLIGHT]vk.CommandBuffer
@@ -464,7 +467,7 @@ main :: proc() {
 				state.device,
 				&vk.CommandBufferAllocateInfo {
 					sType = .COMMAND_BUFFER_ALLOCATE_INFO,
-					commandPool = state.swapchain.pool,
+					commandPool = state.render.pool,
 					level = .PRIMARY,
 					commandBufferCount = MAX_FRAMES_IN_FLIGHT,
 				},
@@ -472,7 +475,7 @@ main :: proc() {
 			),
 		)
 		for b, i in bufs {
-			state.swapchain.bufs[i] = b
+			state.render.frames[i].cmd = b
 		}
 		must(
 			vk.AllocateCommandBuffers(
@@ -483,12 +486,12 @@ main :: proc() {
 					level = .PRIMARY,
 					commandBufferCount = 1,
 				},
-				&state.imm.bufs[0],
+				&state.imm.frames[0].cmd,
 			),
 		)
 	}
 	defer {
-		vk.DestroyCommandPool(state.device, state.swapchain.pool, nil)
+		vk.DestroyCommandPool(state.device, state.render.pool, nil)
 		vk.DestroyCommandPool(state.device, state.imm.pool, nil)
 	}
 
@@ -502,24 +505,20 @@ main :: proc() {
 			sType = .SEMAPHORE_CREATE_INFO,
 		}
 		for i in 0 ..< MAX_FRAMES_IN_FLIGHT {
-			must(vk.CreateFence(state.device, &fence_info, nil, &state.swapchain.fences[i]))
+			must(vk.CreateFence(state.device, &fence_info, nil, &state.render.frames[i].fence))
+			must(vk.CreateSemaphore(state.device, &sem_info, nil, &state.sync[i].swapsema))
+			must(vk.CreateSemaphore(state.device, &sem_info, nil, &state.sync[i].rendersema))
 		}
-		for i in 0 ..< state.swapchain.count {
-			must(vk.CreateSemaphore(state.device, &sem_info, nil, &state.swapchain.semas[i]))
-			must(vk.CreateSemaphore(state.device, &sem_info, nil, &state.swapchain.finis[i]))
-		}
-		must(vk.CreateFence(state.device, &fence_info, nil, &state.imm.fences[0]))
+		must(vk.CreateFence(state.device, &fence_info, nil, &state.imm.frames[0].fence))
 
 	}
 	defer {
-		for f in state.swapchain.fences {
-			vk.DestroyFence(state.device, f, nil)
+		for f in state.render.frames do vk.DestroyFence(state.device, f.fence, nil)
+		vk.DestroyFence(state.device, state.imm.frames[0].fence, nil)
+		for s in state.sync {
+			vk.DestroySemaphore(state.device, s.swapsema, nil)
+			vk.DestroySemaphore(state.device, s.rendersema, nil)
 		}
-		for i in 0 ..< state.swapchain.count {
-			vk.DestroySemaphore(state.device, state.swapchain.semas[i], nil)
-			vk.DestroySemaphore(state.device, state.swapchain.finis[i], nil)
-		}
-		vk.DestroyFence(state.device, state.imm.fences[0], nil)
 	}
 	// }
 
@@ -751,15 +750,15 @@ main :: proc() {
 		proc "c" (function_name: cstring, user_data: rawptr) -> vk.ProcVoidFunction {
 			return vk.GetInstanceProcAddr((vk.Instance)(user_data), function_name)
 		},
-		state.instance,
+		state.phy.instance,
 	)
 	imdl.InitForVulkan(state.window)
 	color_attach := []vk.Format{SURF_FMT.format}
 	imvk.Init(
 		&imvk.InitInfo {
 			ApiVersion = vk.API_VERSION_1_3,
-			Instance = state.instance,
-			PhysicalDevice = state.physical_device,
+			Instance = state.phy.instance,
+			PhysicalDevice = state.phy.device,
 			Device = state.device,
 			QueueFamily = state.gfx.idx,
 			Queue = state.gfx.q,
@@ -1028,7 +1027,7 @@ create_shader_module :: proc(code: []byte) -> (module: vk.ShaderModule) {
 }
 
 mtype :: proc(properties: vk.MemoryPropertyFlags, requiredTypeBits: u32) -> u32 {
-	for mtype, i in state.mprop.memoryTypes[:state.mprop.memoryTypeCount] {
+	for mtype, i in state.phy.mem.memoryTypes[:state.phy.mem.memoryTypeCount] {
 		if (1 << u32(i)) & requiredTypeBits == 0 do continue
 
 		if (properties & mtype.propertyFlags) != properties do continue
@@ -1196,32 +1195,32 @@ draw_imgui :: proc(buf: vk.CommandBuffer, view: vk.ImageView, extent: vk.Extent2
 }
 
 imm_exec :: proc(f: proc(_: vk.CommandBuffer, _: ..any), args: ..any) {
-	must(vk.ResetFences(state.device, 1, &state.imm.fences[0]))
+	frame := &state.imm.frames[0]
+	must(vk.ResetFences(state.device, 1, &frame.fence))
 
-	cmd := state.imm.bufs[0]
-	must(vk.ResetCommandBuffer(cmd, {}))
+	must(vk.ResetCommandBuffer(frame.cmd, {}))
 	must(
 		vk.BeginCommandBuffer(
-			cmd,
+			frame.cmd,
 			&vk.CommandBufferBeginInfo {
 				sType = .COMMAND_BUFFER_BEGIN_INFO,
 				flags = {.ONE_TIME_SUBMIT},
 			},
 		),
 	)
-	f(cmd, ..args)
-	must(vk.EndCommandBuffer(cmd))
+	f(frame.cmd, ..args)
+	must(vk.EndCommandBuffer(frame.cmd))
 
 	submit_info := vk.SubmitInfo2 {
 		sType                  = .SUBMIT_INFO_2,
 		commandBufferInfoCount = 1,
 		pCommandBufferInfos    = &vk.CommandBufferSubmitInfo {
 			sType = .COMMAND_BUFFER_SUBMIT_INFO,
-			commandBuffer = cmd,
+			commandBuffer = frame.cmd,
 		},
 	}
-	must(vk.QueueSubmit2(state.gfx.q, 1, &submit_info, state.imm.fences[0]))
-	must(vk.WaitForFences(state.device, 1, &state.imm.fences[0], true, max(u64)))
+	must(vk.QueueSubmit2(state.gfx.q, 1, &submit_info, frame.fence))
+	must(vk.WaitForFences(state.device, 1, &frame.fence, true, max(u64)))
 }
 
 draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer, extent: vk.Extent2D) {
@@ -1290,26 +1289,27 @@ draw :: proc(
 	n: u64,
 ) -> vk.Result {
 	fid := n % MAX_FRAMES_IN_FLIGHT
-	must(vk.WaitForFences(state.device, 1, &state.swapchain.fences[fid], true, max(u64)))
+	frame := &state.render.frames[fid]
+	sync := &state.sync[fid]
+	must(vk.WaitForFences(state.device, 1, &frame.fence, true, max(u64)))
 
 	image_index: u32
 	if r := vk.AcquireNextImageKHR(
 		state.device,
 		state.swapchain.chain,
 		max(u64),
-		state.swapchain.semas[fid],
+		sync.swapsema,
 		0,
 		&image_index,
 	); r != .SUCCESS && r != .SUBOPTIMAL_KHR {
 		return r
 	}
-	must(vk.ResetFences(state.device, 1, &state.swapchain.fences[fid]))
-	cmd := state.swapchain.bufs[fid]
+	must(vk.ResetFences(state.device, 1, &frame.fence))
 
-	must(vk.ResetCommandBuffer(cmd, {}))
+	must(vk.ResetCommandBuffer(frame.cmd, {}))
 	must(
 		vk.BeginCommandBuffer(
-			cmd,
+			frame.cmd,
 			&vk.CommandBufferBeginInfo {
 				sType = .COMMAND_BUFFER_BEGIN_INFO,
 				flags = {.ONE_TIME_SUBMIT},
@@ -1318,39 +1318,39 @@ draw :: proc(
 	)
 
 	img := state.swapchain.images[image_index]
-	record(cmd, state.draw.img, .UNDEFINED, .GENERAL)
-	draw_background(cmd, img, extent, effect, n)
+	record(frame.cmd, state.draw.img, .UNDEFINED, .GENERAL)
+	draw_background(frame.cmd, img, extent, effect, n)
 
-	record(cmd, state.draw.img, .GENERAL, .COLOR_ATTACHMENT_OPTIMAL)
-	record(cmd, state.depth.img, .UNDEFINED, .DEPTH_ATTACHMENT_OPTIMAL)
-	draw_geometry(geometry, cmd, extent)
+	record(frame.cmd, state.draw.img, .GENERAL, .COLOR_ATTACHMENT_OPTIMAL)
+	record(frame.cmd, state.depth.img, .UNDEFINED, .DEPTH_ATTACHMENT_OPTIMAL)
+	draw_geometry(geometry, frame.cmd, extent)
 
-	record(cmd, state.draw.img, .COLOR_ATTACHMENT_OPTIMAL, .TRANSFER_SRC_OPTIMAL)
-	record(cmd, img, .UNDEFINED, .TRANSFER_DST_OPTIMAL)
-	cpimg(cmd, state.draw.img, img, extent, state.winext)
+	record(frame.cmd, state.draw.img, .COLOR_ATTACHMENT_OPTIMAL, .TRANSFER_SRC_OPTIMAL)
+	record(frame.cmd, img, .UNDEFINED, .TRANSFER_DST_OPTIMAL)
+	cpimg(frame.cmd, state.draw.img, img, extent, state.winext)
 
-	record(cmd, img, .TRANSFER_DST_OPTIMAL, .COLOR_ATTACHMENT_OPTIMAL)
-	draw_imgui(cmd, state.swapchain.views[image_index], extent)
+	record(frame.cmd, img, .TRANSFER_DST_OPTIMAL, .COLOR_ATTACHMENT_OPTIMAL)
+	draw_imgui(frame.cmd, state.swapchain.views[image_index], extent)
 
-	record(cmd, img, .COLOR_ATTACHMENT_OPTIMAL, .PRESENT_SRC_KHR)
+	record(frame.cmd, img, .COLOR_ATTACHMENT_OPTIMAL, .PRESENT_SRC_KHR)
 
-	must(vk.EndCommandBuffer(cmd))
+	must(vk.EndCommandBuffer(frame.cmd))
 
-	ws := sub_info(state.swapchain.semas[fid], {.COLOR_ATTACHMENT_OUTPUT_KHR})
-	ps := sub_info(state.swapchain.finis[fid], {.ALL_GRAPHICS_KHR})
+	ws := sub_info(sync.swapsema, {.COLOR_ATTACHMENT_OUTPUT_KHR})
+	ps := sub_info(sync.rendersema, {.ALL_GRAPHICS_KHR})
 	submit_info := vk.SubmitInfo2 {
 		sType                    = .SUBMIT_INFO_2,
 		commandBufferInfoCount   = 1,
 		pCommandBufferInfos      = &vk.CommandBufferSubmitInfo {
 			sType = .COMMAND_BUFFER_SUBMIT_INFO,
-			commandBuffer = cmd,
+			commandBuffer = frame.cmd,
 		},
 		waitSemaphoreInfoCount   = 1,
 		pWaitSemaphoreInfos      = &ws,
 		signalSemaphoreInfoCount = 1,
 		pSignalSemaphoreInfos    = &ps,
 	}
-	must(vk.QueueSubmit2(state.gfx.q, 1, &submit_info, state.swapchain.fences[fid]))
+	must(vk.QueueSubmit2(state.gfx.q, 1, &submit_info, frame.fence))
 
 	present_info := vk.PresentInfoKHR {
 		sType              = .PRESENT_INFO_KHR,
@@ -1360,7 +1360,7 @@ draw :: proc(
 		// 	pFences = &state.swapchain.frames[(image_index + 1) % MAX_FRAMES_IN_FLIGHT].fence,
 		// },
 		waitSemaphoreCount = 1,
-		pWaitSemaphores    = &state.swapchain.finis[fid],
+		pWaitSemaphores    = &sync.rendersema,
 		swapchainCount     = 1,
 		pSwapchains        = &state.swapchain.chain,
 		pImageIndices      = &image_index,
@@ -1536,13 +1536,13 @@ create_swapchain :: proc() {
 	state.winext = vk.Extent2D {
 		width  = clamp(
 			u32(w),
-			state.swapchain.caps.minImageExtent.width,
-			state.swapchain.caps.maxImageExtent.width,
+			state.phy.caps.minImageExtent.width,
+			state.phy.caps.maxImageExtent.width,
 		),
 		height = clamp(
 			u32(h),
-			state.swapchain.caps.minImageExtent.height,
-			state.swapchain.caps.maxImageExtent.height,
+			state.phy.caps.minImageExtent.height,
+			state.phy.caps.maxImageExtent.height,
 		),
 	}
 
@@ -1551,14 +1551,14 @@ create_swapchain :: proc() {
 			state.device,
 			&vk.SwapchainCreateInfoKHR {
 				sType            = .SWAPCHAIN_CREATE_INFO_KHR,
-				surface          = state.swapchain.surf,
+				surface          = state.phy.surf,
 				minImageCount    = state.swapchain.count,
 				imageFormat      = SURF_FMT.format,
 				imageColorSpace  = SURF_FMT.colorSpace,
 				imageExtent      = state.winext,
 				imageArrayLayers = 1,
 				imageUsage       = {.COLOR_ATTACHMENT, .TRANSFER_DST},
-				preTransform     = state.swapchain.caps.currentTransform,
+				preTransform     = state.phy.caps.currentTransform,
 				compositeAlpha   = {.OPAQUE},
 				presentMode      = PMODE,
 				clipped          = true,
@@ -1615,7 +1615,7 @@ pick_physical_device :: proc() -> vk.Result {
 	count: u32
 	phys: sa.Small_Array(N_PHYS, vk.PhysicalDevice)
 	count = N_PHYS
-	vk.EnumeratePhysicalDevices(state.instance, &count, raw_data(phys.data[:])) or_return
+	vk.EnumeratePhysicalDevices(state.phy.instance, &count, raw_data(phys.data[:])) or_return
 	assert(count != 0, "no GPU found")
 	phys.len = int(count)
 
@@ -1684,7 +1684,7 @@ pick_physical_device :: proc() -> vk.Result {
 			props.limits.maxImageDimension2D,
 		)
 		if score > best_device_score {
-			state.physical_device = device
+			state.phy.device = device
 			best_device_score = score
 		}
 		log.infof("vulkan: device %q scored %v", name, score)
