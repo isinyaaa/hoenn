@@ -1564,21 +1564,14 @@ create_drawsurf :: proc(ext: vk.Extent2D) {
 		),
 	)
 
-	vk.UpdateDescriptorSets(
-		state.device,
-		1,
-		&vk.WriteDescriptorSet {
-			sType = .WRITE_DESCRIPTOR_SET,
-			dstSet = state.descriptors[.draw].set,
-			descriptorCount = 1,
-			descriptorType = .STORAGE_IMAGE,
-			pImageInfo = &vk.DescriptorImageInfo {
-				imageView = state.draw.view,
-				imageLayout = .GENERAL,
-			},
-		},
+	write_set(
+		state.descriptors[.draw].set,
 		0,
-		nil,
+		state.draw.view,
+		state.draw.img,
+		{},
+		.GENERAL,
+		.STORAGE_IMAGE,
 	)
 
 	state.depth.fmt = .D32_SFLOAT
@@ -1608,6 +1601,35 @@ create_drawsurf :: proc(ext: vk.Extent2D) {
 			nil,
 			&state.depth.view,
 		),
+	)
+}
+
+write_set :: proc(
+	set: vk.DescriptorSet,
+	binding: u32,
+	view: vk.ImageView,
+	img: vk.Image,
+	sampler: vk.Sampler,
+	layout: vk.ImageLayout,
+	dtype: vk.DescriptorType,
+) {
+	vk.UpdateDescriptorSets(
+		state.device,
+		1,
+		&vk.WriteDescriptorSet {
+			sType = .WRITE_DESCRIPTOR_SET,
+			dstSet = set,
+			dstBinding = binding,
+			descriptorCount = 1,
+			descriptorType = dtype,
+			pImageInfo = &vk.DescriptorImageInfo {
+				imageView = view,
+				imageLayout = layout,
+				sampler = sampler,
+			},
+		},
+		0,
+		nil,
 	)
 }
 
