@@ -54,6 +54,8 @@ FLAT_SHADER :: #load("shaders/flat.spv")
 GLB_PATH :: "assets/basicmesh.glb"
 
 INIT_RES :: [2]i32{1920, 1080}
+// max supported resolution
+DRAW_RES :: [2]i32{3840, 2160}
 PROG :: "vk"
 
 N_QFAM :: 8
@@ -167,6 +169,7 @@ state := struct {
 		surf:         vk.SurfaceKHR,
 		chain:        vk.SwapchainKHR,
 		caps:         vk.SurfaceCapabilitiesKHR,
+		ext:          vk.Extent2D,
 		using frames: Re(MAX_FRAMES_IN_FLIGHT),
 		count:        u32,
 		semas:        []vk.Semaphore,
@@ -174,20 +177,21 @@ state := struct {
 		images:       []vk.Image,
 		views:        []vk.ImageView,
 	},
-	ext:             vk.Extent2D,
-	drawimg:         Image,
-	depthimg:        Image,
+	winext:          vk.Extent2D,
+	drawext:         vk.Extent2D,
+	draw:            Image,
+	depth:           Image,
 	shaders:         [Shader_Type]vk.ShaderModule,
 	modes:           [Pipe_Type]#soa[2]Pipeline,
 	cds:             vk.DescriptorSet,
 }{}
 
 Image :: struct {
-	buf:  vk.Image,
+	img:  vk.Image,
 	view: vk.ImageView,
-	ext:  vk.Extent3D,
 	fmt:  vk.Format,
 	mem:  vk.DeviceMemory,
+	// ext:  vk.Extent3D,
 	// memreq: vk.MemoryRequirements,
 }
 
@@ -353,7 +357,7 @@ main :: proc() {
 	)
 	count := state.swapchain.caps.minImageCount + 1
 	if state.swapchain.caps.maxImageCount > 0 {
-		count = state.swapchain.caps.maxImageCount
+		count = min(count, state.swapchain.caps.maxImageCount)
 	}
 	assert(count > 0, "no swapchain")
 	state.swapchain.count = count
@@ -431,7 +435,12 @@ main :: proc() {
 	}
 
 	create_swapchain()
-	defer destroy_swapchain()
+	create_drawsurf(vk.Extent2D{width = u32(DRAW_RES[0]), height = u32(DRAW_RES[1])})
+	defer {
+		destroy_swapchain()
+		destroy_image(state.draw)
+		destroy_image(state.depth)
+	}
 
 	// create cmd pool
 	{
@@ -1257,8 +1266,8 @@ draw_background :: proc(buf: vk.CommandBuffer, img: vk.Image, effect: Compute_Ef
 	)
 	vk.CmdDispatch(
 		buf,
-		u32(math.ceil(f32(state.drawimg.ext.width) / 16.0)),
-		u32(math.ceil(f32(state.drawimg.ext.height) / 16.0)),
+		u32(math.ceil(f32(state.winext.width) / 16.0)),
+		u32(math.ceil(f32(state.winext.height) / 16.0)),
 		1,
 	)
 }
@@ -1269,7 +1278,7 @@ draw_imgui :: proc(buf: vk.CommandBuffer, view: vk.ImageView) {
 		&vk.RenderingInfo {
 			sType = .RENDERING_INFO,
 			// flags = vk.RenderingFlags,
-			renderArea = {extent = state.ext},
+			renderArea = {extent = state.winext},
 			layerCount = 1,
 			// viewMask:             u32,
 			colorAttachmentCount = 1,
@@ -1323,20 +1332,20 @@ draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer) {
 		buf,
 		&vk.RenderingInfo {
 			sType = .RENDERING_INFO,
-			renderArea = {extent = state.ext},
+			renderArea = {extent = state.winext},
 			layerCount = 1,
 			// viewMask:             u32,
 			colorAttachmentCount = 1,
 			pColorAttachments = &vk.RenderingAttachmentInfo {
 				sType = .RENDERING_ATTACHMENT_INFO,
-				imageView = state.drawimg.view,
+				imageView = state.draw.view,
 				imageLayout = .COLOR_ATTACHMENT_OPTIMAL,
 				loadOp = .LOAD,
 				storeOp = .STORE,
 			},
 			pDepthAttachment = &vk.RenderingAttachmentInfo {
 				sType = .RENDERING_ATTACHMENT_INFO,
-				imageView = state.depthimg.view,
+				imageView = state.depth.view,
 				imageLayout = .DEPTH_ATTACHMENT_OPTIMAL,
 				// resolveMode:        ResolveModeFlags,
 				// resolveImageView:   ImageView,
@@ -1352,13 +1361,17 @@ draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer) {
 		buf,
 		0,
 		1,
-		&vk.Viewport{width = f32(state.ext.width), height = f32(state.ext.height), maxDepth = 1},
+		&vk.Viewport {
+			width = f32(state.winext.width),
+			height = f32(state.winext.height),
+			maxDepth = 1,
+		},
 	)
-	vk.CmdSetScissor(buf, 0, 1, &vk.Rect2D{extent = state.ext})
+	vk.CmdSetScissor(buf, 0, 1, &vk.Rect2D{extent = state.winext})
 
 	perp := linalg.matrix4_perspective(
 		math.PI / 2.0,
-		f32(state.ext.width) / f32(state.ext.height),
+		f32(state.winext.width) / f32(state.winext.height),
 		0.1,
 		100,
 		flip_z_axis = true,
@@ -1413,27 +1426,16 @@ draw :: proc(geometry: Geometry, effect: Compute_Effect, n: u64) -> vk.Result {
 	)
 
 	img := state.swapchain.images[image_index]
-	record(cmd, state.drawimg.buf, .UNDEFINED, .GENERAL)
+	record(cmd, state.draw.img, .UNDEFINED, .GENERAL)
 	draw_background(cmd, img, effect, n)
-	// switch pipe in effect {
-	// case Compute_Effect:
-	// case Gfx_Pipe:
-	// // draw_background(cmd, img, pipe, n)
-	// }
 
-	record(cmd, state.drawimg.buf, .GENERAL, .COLOR_ATTACHMENT_OPTIMAL)
-	record(cmd, state.depthimg.buf, .UNDEFINED, .DEPTH_ATTACHMENT_OPTIMAL)
+	record(cmd, state.draw.img, .GENERAL, .COLOR_ATTACHMENT_OPTIMAL)
+	record(cmd, state.depth.img, .UNDEFINED, .DEPTH_ATTACHMENT_OPTIMAL)
 	draw_geometry(geometry, cmd)
-	record(cmd, state.drawimg.buf, .COLOR_ATTACHMENT_OPTIMAL, .GENERAL)
-	// record(cmd, state.drawimg.buf, .GENERAL, .TRANSFER_SRC_OPTIMAL)
+
+	record(cmd, state.draw.img, .COLOR_ATTACHMENT_OPTIMAL, .TRANSFER_SRC_OPTIMAL)
 	record(cmd, img, .UNDEFINED, .TRANSFER_DST_OPTIMAL)
-	cpimg(
-		cmd,
-		state.drawimg.buf,
-		img,
-		vk.Extent2D{width = state.drawimg.ext.width, height = state.drawimg.ext.height},
-		state.ext,
-	)
+	cpimg(cmd, state.draw.img, img, state.winext, state.winext)
 
 	record(cmd, img, .TRANSFER_DST_OPTIMAL, .COLOR_ATTACHMENT_OPTIMAL)
 	draw_imgui(cmd, state.swapchain.views[image_index])
@@ -1481,7 +1483,7 @@ cpimg :: proc(buf: vk.CommandBuffer, src, dest: vk.Image, sext, dext: vk.Extent2
 		&vk.BlitImageInfo2 {
 			sType = .BLIT_IMAGE_INFO_2,
 			srcImage = src,
-			srcImageLayout = .GENERAL,
+			srcImageLayout = .TRANSFER_SRC_OPTIMAL,
 			dstImage = dest,
 			dstImageLayout = .TRANSFER_DST_OPTIMAL,
 			regionCount = 1,
@@ -1525,29 +1527,109 @@ record :: proc(buf: vk.CommandBuffer, img: vk.Image, ol, nl: vk.ImageLayout) {
 }
 
 sub_range :: proc(aspect: vk.ImageAspectFlags) -> vk.ImageSubresourceRange {
-	return {
-		aspectMask = aspect,
-		levelCount = 1,
-		layerCount = 1,
-		// baseMipLevel = 0,
-		// baseArrayLayer = 0,
-	}
+	return {aspectMask = aspect, levelCount = 1, layerCount = 1}
 }
 
 recreate_swapchain :: proc() {
-	// Don't do anything when minimized.
-	// for w, h := glfw.GetFramebufferSize(state.window);
-	//     w == 0 || h == 0;
-	//     w, h = glfw.GetFramebufferSize(state.window) {
-	// 	glfw.WaitEvents()
-	//
-	// 	// Handle closing while minimized.
-	// 	if glfw.WindowShouldClose(state.window) {break}
-	// }
-
 	vk.DeviceWaitIdle(state.device)
 	destroy_swapchain()
+
 	create_swapchain()
+
+	if state.winext.width < state.drawext.width && state.winext.height < state.drawext.height do return
+	log.warnf("recreating draw surface with dim %v", state.winext)
+
+	destroy_image(state.draw)
+	destroy_image(state.depth)
+
+	create_drawsurf(state.winext)
+}
+
+create_drawsurf :: proc(ext: vk.Extent2D) {
+	state.drawext = ext
+
+	ext3 := vk.Extent3D {
+		width  = ext.width,
+		height = ext.height,
+		depth  = 1,
+	}
+	state.draw.fmt = .R16G16B16A16_SFLOAT
+
+	state.draw.img, state.draw.mem = create_image(
+		&vk.ImageCreateInfo {
+			sType = .IMAGE_CREATE_INFO,
+			flags = {},
+			imageType = .D2,
+			format = state.draw.fmt,
+			extent = ext3,
+			mipLevels = 1,
+			arrayLayers = 1,
+			samples = {._1},
+			tiling = .OPTIMAL,
+			usage = {.TRANSFER_SRC, .TRANSFER_DST, .STORAGE, .COLOR_ATTACHMENT},
+		},
+	)
+	must(
+		vk.CreateImageView(
+			state.device,
+			&vk.ImageViewCreateInfo {
+				sType = .IMAGE_VIEW_CREATE_INFO,
+				image = state.draw.img,
+				viewType = .D2,
+				format = state.draw.fmt,
+				subresourceRange = sub_range({.COLOR}),
+			},
+			nil,
+			&state.draw.view,
+		),
+	)
+
+	vk.UpdateDescriptorSets(
+		state.device,
+		1,
+		&vk.WriteDescriptorSet {
+			sType = .WRITE_DESCRIPTOR_SET,
+			dstSet = state.cds,
+			descriptorCount = 1,
+			descriptorType = .STORAGE_IMAGE,
+			pImageInfo = &vk.DescriptorImageInfo {
+				imageView = state.draw.view,
+				imageLayout = .GENERAL,
+			},
+		},
+		0,
+		nil,
+	)
+
+	state.depth.fmt = .D32_SFLOAT
+	state.depth.img, state.depth.mem = create_image(
+		&vk.ImageCreateInfo {
+			sType = .IMAGE_CREATE_INFO,
+			flags = {},
+			imageType = .D2,
+			format = state.depth.fmt,
+			extent = ext3,
+			mipLevels = 1,
+			arrayLayers = 1,
+			samples = {._1},
+			tiling = .OPTIMAL,
+			usage = {.DEPTH_STENCIL_ATTACHMENT},
+		},
+	)
+	must(
+		vk.CreateImageView(
+			state.device,
+			&vk.ImageViewCreateInfo {
+				sType = .IMAGE_VIEW_CREATE_INFO,
+				image = state.depth.img,
+				viewType = .D2,
+				format = state.depth.fmt,
+				subresourceRange = sub_range({.DEPTH}),
+			},
+			nil,
+			&state.depth.view,
+		),
+	)
 }
 
 create_swapchain :: proc() {
@@ -1560,8 +1642,21 @@ create_swapchain :: proc() {
 	// 	)
 	// }
 
-	state.ext = choose_swapchain_extent()
-	// pModes := []vk.PresentModeKHR{.FIFO}
+	w, h: i32
+	sdl.GetWindowSizeInPixels(state.window, &w, &h)
+	state.winext = vk.Extent2D {
+		width  = clamp(
+			u32(w),
+			state.swapchain.caps.minImageExtent.width,
+			state.swapchain.caps.maxImageExtent.width,
+		),
+		height = clamp(
+			u32(h),
+			state.swapchain.caps.minImageExtent.height,
+			state.swapchain.caps.maxImageExtent.height,
+		),
+	}
+
 	must(
 		vk.CreateSwapchainKHR(
 			state.device,
@@ -1571,7 +1666,7 @@ create_swapchain :: proc() {
 				minImageCount    = state.swapchain.count,
 				imageFormat      = SURF_FMT.format,
 				imageColorSpace  = SURF_FMT.colorSpace,
-				imageExtent      = state.ext,
+				imageExtent      = state.winext,
 				imageArrayLayers = 1,
 				imageUsage       = {.COLOR_ATTACHMENT, .TRANSFER_DST},
 				preTransform     = state.swapchain.caps.currentTransform,
@@ -1589,7 +1684,6 @@ create_swapchain :: proc() {
 		),
 	)
 
-	// Setup swapchain images.
 	count: u32 = state.swapchain.count
 	must(
 		vk.GetSwapchainImagesKHR(
@@ -1610,118 +1704,6 @@ create_swapchain :: proc() {
 		}
 		must(vk.CreateImageView(state.device, &create_info, nil, &state.swapchain.views[i]))
 	}
-
-	state.drawimg.ext = {
-		width  = state.ext.width,
-		height = state.ext.height,
-		depth  = 1,
-	}
-	state.drawimg.fmt = .R16G16B16A16_SFLOAT
-
-	state.drawimg.buf, state.drawimg.mem = create_image(
-		&vk.ImageCreateInfo {
-			sType       = .IMAGE_CREATE_INFO,
-			flags       = {},
-			imageType   = .D2,
-			format      = state.drawimg.fmt,
-			extent      = state.drawimg.ext,
-			mipLevels   = 1,
-			arrayLayers = 1,
-			samples     = {._1},
-			tiling      = .OPTIMAL,
-			usage       = {.TRANSFER_SRC, .TRANSFER_DST, .STORAGE, .COLOR_ATTACHMENT},
-			// sharingMode:           SharingMode,
-			// queueFamilyIndexCount: u32,
-			// pQueueFamilyIndices:   [^]u32,
-			// initialLayout = .,
-		},
-	)
-	must(
-		vk.CreateImageView(
-			state.device,
-			&vk.ImageViewCreateInfo {
-				sType = .IMAGE_VIEW_CREATE_INFO,
-				image = state.drawimg.buf,
-				viewType = .D2,
-				format = state.drawimg.fmt,
-				subresourceRange = sub_range({.COLOR}),
-			},
-			nil,
-			&state.drawimg.view,
-		),
-	)
-
-	vk.UpdateDescriptorSets(
-		state.device,
-		1,
-		&vk.WriteDescriptorSet {
-			sType = .WRITE_DESCRIPTOR_SET,
-			dstSet = state.cds,
-			descriptorCount = 1,
-			descriptorType = .STORAGE_IMAGE,
-			pImageInfo = &vk.DescriptorImageInfo {
-				imageView = state.drawimg.view,
-				imageLayout = .GENERAL,
-			},
-		},
-		0,
-		nil,
-	)
-
-
-	state.depthimg.fmt = .D32_SFLOAT
-	state.depthimg.ext = state.drawimg.ext
-	state.depthimg.buf, state.depthimg.mem = create_image(
-		&vk.ImageCreateInfo {
-			sType       = .IMAGE_CREATE_INFO,
-			flags       = {},
-			imageType   = .D2,
-			format      = state.depthimg.fmt,
-			extent      = state.depthimg.ext,
-			mipLevels   = 1,
-			arrayLayers = 1,
-			samples     = {._1},
-			tiling      = .OPTIMAL,
-			usage       = {.DEPTH_STENCIL_ATTACHMENT},
-			// sharingMode:           SharingMode,
-			// queueFamilyIndexCount: u32,
-			// pQueueFamilyIndices:   [^]u32,
-			// initialLayout = .,
-		},
-	)
-	must(
-		vk.CreateImageView(
-			state.device,
-			&vk.ImageViewCreateInfo {
-				sType = .IMAGE_VIEW_CREATE_INFO,
-				image = state.depthimg.buf,
-				viewType = .D2,
-				format = state.depthimg.fmt,
-				subresourceRange = sub_range({.DEPTH}),
-			},
-			nil,
-			&state.depthimg.view,
-		),
-	)
-}
-
-choose_swapchain_extent :: proc() -> vk.Extent2D {
-	// if state.swapchain.caps.currentExtent.width != max(u32) do return state.swapchain.caps.currentExtent
-
-	w, h: i32
-	sdl.GetWindowSizeInPixels(state.window, &w, &h)
-	return vk.Extent2D {
-		width = clamp(
-			u32(w),
-			state.swapchain.caps.minImageExtent.width,
-			state.swapchain.caps.maxImageExtent.width,
-		),
-		height = clamp(
-			u32(h),
-			state.swapchain.caps.minImageExtent.height,
-			state.swapchain.caps.maxImageExtent.height,
-		),
-	}
 }
 
 destroy_swapchain :: proc() {
@@ -1729,27 +1711,12 @@ destroy_swapchain :: proc() {
 		vk.DestroyImageView(state.device, view, nil)
 	}
 	vk.DestroySwapchainKHR(state.device, state.swapchain.chain, nil)
-	destroy_image(state.drawimg)
-	destroy_image(state.depthimg)
-
-	// cleanup
-	// // All steps succeeded.
-	// (*pAllocation)->InitImageUsage(*pImageCreateInfo);
-	// if(pAllocationInfo != VMA_NULL)
-	// {
-	//     allocator->GetAllocationInfo(*pAllocation, pAllocationInfo);
-	// }
-	// allocator->FreeMemory(
-	//     1, // allocationCount
-	//     pAllocation);
-	// *pAllocation = VK_NULL_HANDLE;
-	// (*allocator->GetVulkanFunctions().vkDestroyImage)(allocator->m_hDevice, *pImage, allocator->GetAllocationCallbacks());
 }
 
-destroy_image :: proc(img: Image) {
-	vk.FreeMemory(state.device, img.mem, nil)
-	vk.DestroyImage(state.device, img.buf, nil)
-	vk.DestroyImageView(state.device, img.view, nil)
+destroy_image :: proc(im: Image) {
+	vk.FreeMemory(state.device, im.mem, nil)
+	vk.DestroyImage(state.device, im.img, nil)
+	vk.DestroyImageView(state.device, im.view, nil)
 }
 
 N_PHYS :: 3
