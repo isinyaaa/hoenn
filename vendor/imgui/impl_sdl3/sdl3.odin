@@ -25,6 +25,7 @@ when ODIN_OS == .Windows {
 @(link_prefix = "ImGui_ImplSDL3_", default_calling_convention = "c")
 foreign lib {
 	InitForVulkan :: proc(window: ^sdl.Window) -> bool ---
+	Shutdown :: proc() ---
 	ProcessEvent :: proc(event: ^sdl.Event) -> bool ---
 	NewFrame :: proc() ---
 }

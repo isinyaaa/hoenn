@@ -27,20 +27,23 @@ when ODIN_OS == .Darwin {
 	DEVICE_EXTENSIONS := []cstring {
 		vk.KHR_SWAPCHAIN_EXTENSION_NAME,
 		vk.KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
-		vk.EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
-		vk.KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
-		vk.KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
-		vk.EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+		// maybe use these if vulkan < 1.3
+		// vk.EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
+		// vk.KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+		// vk.KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+		// vk.EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+		// vk.EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME,
 	}
 } else {
 	DEVICE_EXTENSIONS := []cstring {
 		// vk.EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
 		// vk.EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME,
 		vk.KHR_SWAPCHAIN_EXTENSION_NAME,
-		vk.EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
-		vk.KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
-		vk.KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
-		vk.EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+		// vk.EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
+		// vk.KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+		// vk.KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+		// vk.EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+		// vk.EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME,
 	}
 }
 
@@ -161,6 +164,24 @@ Geometry :: enum {
 	monkey,
 }
 
+Image :: struct {
+	img:  vk.Image,
+	view: vk.ImageView,
+	fmt:  vk.Format,
+	mem:  vk.DeviceMemory,
+}
+
+Descriptor :: struct {
+	set:    vk.DescriptorSet,
+	layout: vk.DescriptorSetLayout,
+}
+
+Bound_Resource :: enum {
+	draw,
+	image,
+	scene,
+}
+
 state := struct {
 	phy:             struct {
 		instance: vk.Instance,
@@ -192,7 +213,9 @@ state := struct {
 		draw, depth:   Image,
 		shaders:       [Shader_Type]vk.ShaderModule,
 		modes:         [Pipe_Type]#soa[2]Pipeline,
-		descriptors:   vk.DescriptorSet,
+		pool:          vk.DescriptorPool,
+		frame_pools:   [MAX_FRAMES_IN_FLIGHT]vk.DescriptorPool,
+		descriptors:   [Bound_Resource]Descriptor,
 	},
 	swapchain:       struct {
 		chain:  vk.SwapchainKHR,
@@ -203,16 +226,6 @@ state := struct {
 	},
 	winext, drawext: vk.Extent2D,
 }{}
-
-Image :: struct {
-	img:  vk.Image,
-	view: vk.ImageView,
-	fmt:  vk.Format,
-	mem:  vk.DeviceMemory,
-	// ext:  vk.Extent3D,
-	// memreq: vk.MemoryRequirements,
-}
-
 
 main :: proc() {
 	context.logger = log.create_console_logger()
@@ -258,13 +271,24 @@ main :: proc() {
 			if context.logger.lowest_level <= .Info do severity |= {.INFO}
 			if context.logger.lowest_level <= .Debug do severity |= {.VERBOSE}
 
-			dbg_create_info := vk.DebugUtilsMessengerCreateInfoEXT {
+			feats := []vk.ValidationFeatureEnableEXT{.GPU_ASSISTED, .BEST_PRACTICES}
+			create_info.pNext = &vk.DebugUtilsMessengerCreateInfoEXT {
 				sType           = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
 				messageSeverity = severity,
-				messageType     = {.GENERAL, .VALIDATION, .PERFORMANCE, .DEVICE_ADDRESS_BINDING},
+				messageType     = {
+					.GENERAL,
+					.VALIDATION,
+					.PERFORMANCE,
+					// NOTE: unsupported on moltenvk
+					//.DEVICE_ADDRESS_BINDING
+				},
 				pfnUserCallback = vk_messenger_callback,
+				pNext           = &vk.ValidationFeaturesEXT {
+					sType = .VALIDATION_FEATURES_EXT,
+					enabledValidationFeatureCount = u32(len(feats)),
+					pEnabledValidationFeatures = raw_data(feats),
+				},
 			}
-			create_info.pNext = &dbg_create_info
 		}
 
 		create_info.enabledExtensionCount = u32(len(extensions))
@@ -325,6 +349,12 @@ main :: proc() {
 				state.phy.device,
 				&vk.DeviceCreateInfo {
 					sType = .DEVICE_CREATE_INFO,
+					pQueueCreateInfos = raw_data(sa.slice(&q_infos)),
+					queueCreateInfoCount = u32(q_infos.len),
+					enabledLayerCount = create_info.enabledLayerCount,
+					ppEnabledLayerNames = create_info.ppEnabledLayerNames,
+					ppEnabledExtensionNames = raw_data(DEVICE_EXTENSIONS[:]),
+					enabledExtensionCount = u32(len(DEVICE_EXTENSIONS)),
 					pNext = &vk.PhysicalDeviceSynchronization2Features {
 						sType = .PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
 						synchronization2 = true,
@@ -338,12 +368,6 @@ main :: proc() {
 							},
 						},
 					},
-					pQueueCreateInfos = raw_data(sa.slice(&q_infos)),
-					queueCreateInfoCount = u32(q_infos.len),
-					enabledLayerCount = create_info.enabledLayerCount,
-					ppEnabledLayerNames = create_info.ppEnabledLayerNames,
-					ppEnabledExtensionNames = raw_data(DEVICE_EXTENSIONS[:]),
-					enabledExtensionCount = u32(len(DEVICE_EXTENSIONS)),
 				},
 				nil,
 				&state.device,
@@ -377,59 +401,32 @@ main :: proc() {
 	state.swapchain.images = make([]vk.Image, state.swapchain.count)
 	state.swapchain.views = make([]vk.ImageView, state.swapchain.count)
 
-	// descriptors
-	dpool: vk.DescriptorPool
-	dsl: vk.DescriptorSetLayout
 	{
 		maxSets :: 10
-		sizes := []vk.DescriptorPoolSize{{.STORAGE_IMAGE, maxSets}}
-		must(
-			vk.CreateDescriptorPool(
-				state.device,
-				&vk.DescriptorPoolCreateInfo {
-					sType = .DESCRIPTOR_POOL_CREATE_INFO,
-					flags = {.FREE_DESCRIPTOR_SET},
-					maxSets = maxSets,
-					poolSizeCount = u32(len(sizes)),
-					pPoolSizes = raw_data(sizes),
-				},
-				nil,
-				&dpool,
-			),
+		state.pool = create_pool(
+		10,
+		{
+			{.STORAGE_IMAGE, 1},
+			{.UNIFORM_BUFFER, 1},
+			// {.STORAGE_BUFFER, 3},
+			// {.COMBINED_IMAGE_SAMPLER, 4},
+		},
 		)
-		must(
-			vk.CreateDescriptorSetLayout(
-				state.device,
-				&vk.DescriptorSetLayoutCreateInfo {
-					sType = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-					bindingCount = 1,
-					pBindings = &vk.DescriptorSetLayoutBinding {
-						descriptorCount = 1,
-						stageFlags = {.COMPUTE},
-						descriptorType = .STORAGE_IMAGE,
-					},
-				},
-				nil,
-				&dsl,
-			),
-		)
-
-		must(
-			vk.AllocateDescriptorSets(
-				state.device,
-				&vk.DescriptorSetAllocateInfo {
-					sType = .DESCRIPTOR_SET_ALLOCATE_INFO,
-					descriptorPool = dpool,
-					descriptorSetCount = 1,
-					pSetLayouts = &dsl,
-				},
-				&state.descriptors,
-			),
-		)
+		draw := descriptor_layout({.COMPUTE}, {.STORAGE_IMAGE})
+		// image := descriptor_layout({.FRAGMENT}, {.COMBINED_IMAGE_SAMPLER})
+		// scene := descriptor_layout({.FRAGMENT, .VERTEX}, {.STORAGE_IMAGE})
+		state.descriptors[.draw] = { 	//{//.draw = 
+			set    = descriptor_set(state.pool, draw),
+			layout = draw,
+		}
+		// .image = {set = descriptor_set()},
+		// }
 	}
 	defer {
-		vk.DestroyDescriptorPool(state.device, dpool, nil)
-		vk.DestroyDescriptorSetLayout(state.device, dsl, nil)
+		vk.DestroyDescriptorPool(state.device, state.pool, nil)
+		for d in state.descriptors {
+			vk.DestroyDescriptorSetLayout(state.device, d.layout, nil)
+		}
 	}
 
 	create_swapchain()
@@ -526,7 +523,7 @@ main :: proc() {
 			&vk.PipelineLayoutCreateInfo {
 				sType = .PIPELINE_LAYOUT_CREATE_INFO,
 				setLayoutCount = 1,
-				pSetLayouts = &dsl,
+				pSetLayouts = &state.descriptors[.draw].layout,
 				pushConstantRangeCount = 1,
 				pPushConstantRanges = &vk.PushConstantRange {
 					size = size_of(state.compute_pushc),
@@ -534,7 +531,7 @@ main :: proc() {
 				},
 			},
 			nil,
-			&state.modes[.compute].layout[0],
+			&state.modes[.compute][0].layout,
 		),
 	)
 
@@ -572,14 +569,6 @@ main :: proc() {
 		),
 	)
 	color_attach_render := []vk.Format{state.draw.fmt}
-	pipe_render := vk.PipelineRenderingCreateInfo {
-		sType                   = .PIPELINE_RENDERING_CREATE_INFO_KHR,
-		// viewMask:                u32,
-		colorAttachmentCount    = u32(len(color_attach_render)),
-		pColorAttachmentFormats = raw_data(color_attach_render),
-		depthAttachmentFormat   = state.depth.fmt,
-		// stencilAttachmentFormat: Format,
-	}
 
 	// gfx pipeline
 	{
@@ -588,17 +577,17 @@ main :: proc() {
 			vk.CreatePipelineLayout(
 				state.device,
 				&vk.PipelineLayoutCreateInfo {
-					sType                  = .PIPELINE_LAYOUT_CREATE_INFO,
-					// setLayoutCount = 1,
-					// pSetLayouts = &dsl,
+					sType = .PIPELINE_LAYOUT_CREATE_INFO,
+					setLayoutCount = 1,
+					pSetLayouts = &state.descriptors[.draw].layout,
 					pushConstantRangeCount = 1,
-					pPushConstantRanges    = &vk.PushConstantRange {
+					pPushConstantRanges = &vk.PushConstantRange {
 						size = size_of(state.gfx_pushc),
 						stageFlags = {.VERTEX},
 					},
 				},
 				nil,
-				&state.modes[.gfx].layout[0],
+				&state.modes[.gfx][0].layout,
 			),
 		)
 		stages := []vk.PipelineShaderStageCreateInfo {
@@ -691,7 +680,14 @@ main :: proc() {
 						pDynamicStates = raw_data(dynamic_states),
 					},
 					layout              = state.modes[.gfx].layout[0],
-					pNext               = &pipe_render,
+					pNext               = &vk.PipelineRenderingCreateInfo {
+						sType                   = .PIPELINE_RENDERING_CREATE_INFO_KHR,
+						// viewMask:                u32,
+						colorAttachmentCount    = u32(len(color_attach_render)),
+						pColorAttachmentFormats = raw_data(color_attach_render),
+						depthAttachmentFormat   = state.depth.fmt,
+						// stencilAttachmentFormat: Format,
+					},
 				},
 				nil,
 				&state.modes[.gfx].pipeline[0],
@@ -734,77 +730,61 @@ main :: proc() {
 	defer for m in meshes do destroy_mesh(m.buf)
 
 	// imgui init
-	impool: vk.DescriptorPool
-	{
-		maxSets :: 1000
-		sizes := []vk.DescriptorPoolSize {
-			{.STORAGE_IMAGE, maxSets},
-			{.STORAGE_BUFFER, maxSets},
-			{.UNIFORM_BUFFER, maxSets},
-			{.COMBINED_IMAGE_SAMPLER, maxSets},
-			{.SAMPLER, maxSets},
-			{.SAMPLED_IMAGE, maxSets},
-			{.UNIFORM_TEXEL_BUFFER, maxSets},
-			{.STORAGE_TEXEL_BUFFER, maxSets},
-			{.UNIFORM_BUFFER_DYNAMIC, maxSets},
-			{.STORAGE_BUFFER_DYNAMIC, maxSets},
-			{.INPUT_ATTACHMENT, maxSets},
-		}
-		must(
-			vk.CreateDescriptorPool(
-				state.device,
-				&vk.DescriptorPoolCreateInfo {
-					sType = .DESCRIPTOR_POOL_CREATE_INFO,
-					flags = {.FREE_DESCRIPTOR_SET},
-					maxSets = maxSets,
-					poolSizeCount = u32(len(sizes)),
-					pPoolSizes = raw_data(sizes),
-				},
-				nil,
-				&impool,
-			),
-		)
-
-		imgui.CreateContext()
-		imvk.LoadFunctions(
-			vk.API_VERSION_1_3,
-			proc "c" (function_name: cstring, user_data: rawptr) -> vk.ProcVoidFunction {
-				return vk.GetInstanceProcAddr((vk.Instance)(user_data), function_name)
+	impool := create_pool(
+		10,
+		{
+			{.STORAGE_IMAGE, 1},
+			{.STORAGE_BUFFER, 1},
+			{.UNIFORM_BUFFER, 1},
+			{.COMBINED_IMAGE_SAMPLER, 1},
+			{.SAMPLER, 1},
+			{.SAMPLED_IMAGE, 1},
+			{.UNIFORM_TEXEL_BUFFER, 1},
+			{.STORAGE_TEXEL_BUFFER, 1},
+			{.UNIFORM_BUFFER_DYNAMIC, 1},
+			{.STORAGE_BUFFER_DYNAMIC, 1},
+			{.INPUT_ATTACHMENT, 1},
+		},
+	)
+	defer vk.DestroyDescriptorPool(state.device, impool, nil)
+	imgui.CreateContext()
+	defer imgui.DestroyContext()
+	imvk.LoadFunctions(
+		vk.API_VERSION_1_3,
+		proc "c" (function_name: cstring, user_data: rawptr) -> vk.ProcVoidFunction {
+			return vk.GetInstanceProcAddr((vk.Instance)(user_data), function_name)
+		},
+		state.phy.instance,
+	)
+	imdl.InitForVulkan(state.window)
+	defer imdl.Shutdown()
+	color_attach := []vk.Format{SURF_FMT.format}
+	imvk.Init(
+		&imvk.InitInfo {
+			ApiVersion = vk.API_VERSION_1_3,
+			Instance = state.phy.instance,
+			PhysicalDevice = state.phy.device,
+			Device = state.device,
+			QueueFamily = state.gfx.idx,
+			Queue = state.gfx.q,
+			DescriptorPool = impool,
+			MinImageCount = state.swapchain.count,
+			ImageCount = state.swapchain.count,
+			// MSAASamples = ._1,
+			UseDynamicRendering = true,
+			PipelineRenderingCreateInfo = {
+				sType = .PIPELINE_RENDERING_CREATE_INFO_KHR,
+				colorAttachmentCount = u32(len(color_attach)),
+				pColorAttachmentFormats = raw_data(color_attach),
+				depthAttachmentFormat = state.depth.fmt,
 			},
-			state.phy.instance,
-		)
-		imdl.InitForVulkan(state.window)
-		color_attach := []vk.Format{SURF_FMT.format}
-		imvk.Init(
-			&imvk.InitInfo {
-				ApiVersion = vk.API_VERSION_1_3,
-				Instance = state.phy.instance,
-				PhysicalDevice = state.phy.device,
-				Device = state.device,
-				QueueFamily = state.gfx.idx,
-				Queue = state.gfx.q,
-				DescriptorPool = impool,
-				MinImageCount = state.swapchain.count,
-				ImageCount = state.swapchain.count,
-				// MSAASamples = ._1,
-				UseDynamicRendering = true,
-				PipelineRenderingCreateInfo = {
-					sType = .PIPELINE_RENDERING_CREATE_INFO_KHR,
-					colorAttachmentCount = u32(len(color_attach)),
-					pColorAttachmentFormats = raw_data(color_attach),
-					depthAttachmentFormat = state.depth.fmt,
-				},
-				CheckVkResultFn = imguiCheckVkResult,
-				MinAllocationSize = 1024 * 1024,
-			},
-		)
-		imvk.CreateFontsTexture()
-	}
-	defer {
-		imvk.DestroyFontsTexture()
-		imvk.Shutdown()
-		vk.DestroyDescriptorPool(state.device, impool, nil)
-	}
+			CheckVkResultFn = imguiCheckVkResult,
+			MinAllocationSize = 1024 * 1024,
+		},
+	)
+	defer imvk.Shutdown()
+	imvk.CreateFontsTexture()
+	defer imvk.DestroyFontsTexture()
 
 	defer vk.DeviceWaitIdle(state.device)
 
@@ -875,6 +855,76 @@ main :: proc() {
 			frame_num += 1
 		}
 	}
+}
+
+create_pool :: proc(total: u32, ratios: []vk.DescriptorPoolSize) -> (pool: vk.DescriptorPool) {
+	for &p in ratios do p.descriptorCount *= total
+	must(
+		vk.CreateDescriptorPool(
+			state.device,
+			&vk.DescriptorPoolCreateInfo {
+				sType = .DESCRIPTOR_POOL_CREATE_INFO,
+				flags = {.FREE_DESCRIPTOR_SET},
+				maxSets = total,
+				poolSizeCount = u32(len(ratios)),
+				pPoolSizes = raw_data(ratios),
+			},
+			nil,
+			&pool,
+		),
+	)
+	return
+}
+
+descriptor_set :: proc(
+	pool: vk.DescriptorPool,
+	dsl: vk.DescriptorSetLayout,
+) -> (
+	ds: vk.DescriptorSet,
+) {
+	dsl := dsl
+	must(
+		vk.AllocateDescriptorSets(
+			state.device,
+			&vk.DescriptorSetAllocateInfo {
+				sType = .DESCRIPTOR_SET_ALLOCATE_INFO,
+				descriptorPool = pool,
+				descriptorSetCount = 1,
+				pSetLayouts = &dsl,
+			},
+			&ds,
+		),
+	)
+	return
+}
+
+descriptor_layout :: proc(
+	stages: vk.ShaderStageFlags,
+	descriptors: []vk.DescriptorType,
+) -> (
+	dsl: vk.DescriptorSetLayout,
+) {
+	binds := make([]vk.DescriptorSetLayoutBinding, len(descriptors))
+	for &d, i in descriptors {
+		binds[i] = {
+			descriptorCount = 1,
+			stageFlags      = stages,
+			descriptorType  = d,
+		}
+	}
+	must(
+		vk.CreateDescriptorSetLayout(
+			state.device,
+			&vk.DescriptorSetLayoutCreateInfo {
+				sType = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+				bindingCount = u32(len(binds)),
+				pBindings = raw_data(binds),
+			},
+			nil,
+			&dsl,
+		),
+	)
+	return
 }
 
 load_gltf_meshes :: proc(
@@ -1191,7 +1241,7 @@ draw_background :: proc(
 		state.modes[.compute].layout[0],
 		0,
 		1,
-		&state.descriptors,
+		&state.descriptors[.draw].set,
 		0,
 		nil,
 	)
@@ -1519,7 +1569,7 @@ create_drawsurf :: proc(ext: vk.Extent2D) {
 		1,
 		&vk.WriteDescriptorSet {
 			sType = .WRITE_DESCRIPTOR_SET,
-			dstSet = state.descriptors,
+			dstSet = state.descriptors[.draw].set,
 			descriptorCount = 1,
 			descriptorType = .STORAGE_IMAGE,
 			pImageInfo = &vk.DescriptorImageInfo {
@@ -1643,9 +1693,9 @@ destroy_swapchain :: proc() {
 }
 
 destroy_image :: proc(im: Image) {
-	vk.FreeMemory(state.device, im.mem, nil)
-	vk.DestroyImage(state.device, im.img, nil)
 	vk.DestroyImageView(state.device, im.view, nil)
+	vk.DestroyImage(state.device, im.img, nil)
+	vk.FreeMemory(state.device, im.mem, nil)
 }
 
 N_PHYS :: 3
