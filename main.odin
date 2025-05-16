@@ -192,6 +192,7 @@ state := struct {
 		draw, depth:   Image,
 		shaders:       [Shader_Type]vk.ShaderModule,
 		modes:         [Pipe_Type]#soa[2]Pipeline,
+		descriptors:   vk.DescriptorSet,
 	},
 	swapchain:       struct {
 		chain:  vk.SwapchainKHR,
@@ -201,7 +202,6 @@ state := struct {
 		views:  []vk.ImageView,
 	},
 	winext, drawext: vk.Extent2D,
-	cds:             vk.DescriptorSet,
 }{}
 
 Image :: struct {
@@ -250,7 +250,6 @@ main :: proc() {
 			create_info.enabledLayerCount = 1
 
 			append(&extensions, vk.EXT_DEBUG_UTILS_EXTENSION_NAME)
-			// append(&extensions, vk.EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)
 
 			// Severity based on logger level.
 			severity: vk.DebugUtilsMessageSeverityFlagsEXT
@@ -380,20 +379,7 @@ main :: proc() {
 	dsl: vk.DescriptorSetLayout
 	{
 		maxSets :: 10
-		sizes := []vk.DescriptorPoolSize {
-			{.STORAGE_IMAGE, maxSets},
-			// imgui resources
-			{.SAMPLER, maxSets},
-			{.COMBINED_IMAGE_SAMPLER, maxSets},
-			{.SAMPLED_IMAGE, maxSets},
-			{.UNIFORM_TEXEL_BUFFER, maxSets},
-			{.STORAGE_TEXEL_BUFFER, maxSets},
-			{.UNIFORM_BUFFER, maxSets},
-			{.STORAGE_BUFFER, maxSets},
-			{.UNIFORM_BUFFER_DYNAMIC, maxSets},
-			{.STORAGE_BUFFER_DYNAMIC, maxSets},
-			{.INPUT_ATTACHMENT, maxSets},
-		}
+		sizes := []vk.DescriptorPoolSize{{.STORAGE_IMAGE, maxSets}}
 		must(
 			vk.CreateDescriptorPool(
 				state.device,
@@ -434,7 +420,7 @@ main :: proc() {
 					descriptorSetCount = 1,
 					pSetLayouts = &dsl,
 				},
-				&state.cds,
+				&state.descriptors,
 			),
 		)
 	}
@@ -744,42 +730,78 @@ main :: proc() {
 	}
 	defer for m in meshes do destroy_mesh(m.buf)
 
-	imgui.CreateContext()
-	imvk.LoadFunctions(
-		vk.API_VERSION_1_3,
-		proc "c" (function_name: cstring, user_data: rawptr) -> vk.ProcVoidFunction {
-			return vk.GetInstanceProcAddr((vk.Instance)(user_data), function_name)
-		},
-		state.phy.instance,
-	)
-	imdl.InitForVulkan(state.window)
-	color_attach := []vk.Format{SURF_FMT.format}
-	imvk.Init(
-		&imvk.InitInfo {
-			ApiVersion = vk.API_VERSION_1_3,
-			Instance = state.phy.instance,
-			PhysicalDevice = state.phy.device,
-			Device = state.device,
-			QueueFamily = state.gfx.idx,
-			Queue = state.gfx.q,
-			DescriptorPool = dpool,
-			MinImageCount = state.swapchain.count,
-			ImageCount = state.swapchain.count,
-			// MSAASamples = ._1,
-			UseDynamicRendering = true,
-			PipelineRenderingCreateInfo = {
-				sType = .PIPELINE_RENDERING_CREATE_INFO_KHR,
-				colorAttachmentCount = u32(len(color_attach)),
-				pColorAttachmentFormats = raw_data(color_attach),
-				depthAttachmentFormat = state.depth.fmt,
+	// imgui init
+	impool: vk.DescriptorPool
+	{
+		maxSets :: 1000
+		sizes := []vk.DescriptorPoolSize {
+			{.STORAGE_IMAGE, maxSets},
+			{.STORAGE_BUFFER, maxSets},
+			{.UNIFORM_BUFFER, maxSets},
+			{.COMBINED_IMAGE_SAMPLER, maxSets},
+			{.SAMPLER, maxSets},
+			{.SAMPLED_IMAGE, maxSets},
+			{.UNIFORM_TEXEL_BUFFER, maxSets},
+			{.STORAGE_TEXEL_BUFFER, maxSets},
+			{.UNIFORM_BUFFER_DYNAMIC, maxSets},
+			{.STORAGE_BUFFER_DYNAMIC, maxSets},
+			{.INPUT_ATTACHMENT, maxSets},
+		}
+		must(
+			vk.CreateDescriptorPool(
+				state.device,
+				&vk.DescriptorPoolCreateInfo {
+					sType = .DESCRIPTOR_POOL_CREATE_INFO,
+					flags = {.FREE_DESCRIPTOR_SET},
+					maxSets = maxSets,
+					poolSizeCount = u32(len(sizes)),
+					pPoolSizes = raw_data(sizes),
+				},
+				nil,
+				&impool,
+			),
+		)
+
+		imgui.CreateContext()
+		imvk.LoadFunctions(
+			vk.API_VERSION_1_3,
+			proc "c" (function_name: cstring, user_data: rawptr) -> vk.ProcVoidFunction {
+				return vk.GetInstanceProcAddr((vk.Instance)(user_data), function_name)
 			},
-			CheckVkResultFn = imguiCheckVkResult,
-			MinAllocationSize = 1024 * 1024,
-		},
-	)
-	defer imvk.Shutdown()
-	imvk.CreateFontsTexture()
-	defer imvk.DestroyFontsTexture()
+			state.phy.instance,
+		)
+		imdl.InitForVulkan(state.window)
+		color_attach := []vk.Format{SURF_FMT.format}
+		imvk.Init(
+			&imvk.InitInfo {
+				ApiVersion = vk.API_VERSION_1_3,
+				Instance = state.phy.instance,
+				PhysicalDevice = state.phy.device,
+				Device = state.device,
+				QueueFamily = state.gfx.idx,
+				Queue = state.gfx.q,
+				DescriptorPool = impool,
+				MinImageCount = state.swapchain.count,
+				ImageCount = state.swapchain.count,
+				// MSAASamples = ._1,
+				UseDynamicRendering = true,
+				PipelineRenderingCreateInfo = {
+					sType = .PIPELINE_RENDERING_CREATE_INFO_KHR,
+					colorAttachmentCount = u32(len(color_attach)),
+					pColorAttachmentFormats = raw_data(color_attach),
+					depthAttachmentFormat = state.depth.fmt,
+				},
+				CheckVkResultFn = imguiCheckVkResult,
+				MinAllocationSize = 1024 * 1024,
+			},
+		)
+		imvk.CreateFontsTexture()
+	}
+	defer {
+		imvk.DestroyFontsTexture()
+		imvk.Shutdown()
+		vk.DestroyDescriptorPool(state.device, impool, nil)
+	}
 
 	defer vk.DeviceWaitIdle(state.device)
 
@@ -1151,7 +1173,7 @@ draw_background :: proc(
 		state.modes[.compute].layout[0],
 		0,
 		1,
-		&state.cds,
+		&state.descriptors,
 		0,
 		nil,
 	)
@@ -1479,7 +1501,7 @@ create_drawsurf :: proc(ext: vk.Extent2D) {
 		1,
 		&vk.WriteDescriptorSet {
 			sType = .WRITE_DESCRIPTOR_SET,
-			dstSet = state.cds,
+			dstSet = state.descriptors,
 			descriptorCount = 1,
 			descriptorType = .STORAGE_IMAGE,
 			pImageInfo = &vk.DescriptorImageInfo {
