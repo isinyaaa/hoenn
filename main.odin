@@ -5,7 +5,7 @@ import sa "core:container/small_array"
 import "core:fmt"
 import "core:log"
 import "core:math"
-import "core:math/linalg/glsl"
+import "core:math/linalg"
 import "core:mem"
 import "core:reflect"
 import "core:slice"
@@ -122,11 +122,17 @@ Pipeline :: struct {
 	layout:   vk.PipelineLayout,
 }
 
+vec2 :: [2]f32
+vec3 :: [3]f32
+vec4 :: [4]f32
+
+mat4 :: matrix[4, 4]f32
+
 Vertex :: struct #min_field_align (16) {
-	pos:    glsl.vec3,
-	color:  glsl.vec4,
-	normal: glsl.vec3,
-	uv:     glsl.vec2,
+	pos:    vec3,
+	color:  vec4,
+	normal: vec3,
+	uv:     vec2,
 }
 
 Geometry :: enum {
@@ -145,14 +151,14 @@ state := struct {
 	gfx:             VKQ,
 	imm:             Re(1),
 	compute_pushc:   struct {
-		tr:   glsl.vec4,
-		cam:  glsl.vec4,
-		pos:  glsl.vec4,
-		post: glsl.vec4,
+		tr:   vec4,
+		cam:  vec4,
+		pos:  vec4,
+		post: vec4,
 	},
 	geometry:        [Geometry]MeshAsset,
 	gfx_pushc:       struct {
-		tr:        glsl.mat4,
+		tr:        mat4,
 		vert_addr: vk.DeviceAddress,
 	},
 	swapchain:       struct {
@@ -168,6 +174,7 @@ state := struct {
 	},
 	ext:             vk.Extent2D,
 	drawimg:         Image,
+	depthimg:        Image,
 	shaders:         [Shader_Type]vk.ShaderModule,
 	modes:           [Pipe_Type]#soa[2]Pipeline,
 	cds:             vk.DescriptorSet,
@@ -459,10 +466,10 @@ main :: proc() {
 					level = .PRIMARY,
 					commandBufferCount = 1,
 				},
-				raw_data(bufs[:]),
+				&state.imm.bufs[0],
 			),
 		)
-		state.imm.bufs[0] = bufs[0]
+		// [0] = bufs[0]
 	}
 	defer {
 		vk.DestroyCommandPool(state.device, state.swapchain.pool, nil)
@@ -567,7 +574,7 @@ main :: proc() {
 		// viewMask:                u32,
 		colorAttachmentCount    = u32(len(color_attach_render)),
 		pColorAttachmentFormats = raw_data(color_attach_render),
-		// depthAttachmentFormat:   Format,
+		depthAttachmentFormat   = state.depthimg.fmt,
 		// stencilAttachmentFormat: Format,
 	}
 
@@ -647,6 +654,18 @@ main :: proc() {
 							colorWriteMask = {.R, .G, .B, .A},
 						},
 					},
+					pDepthStencilState  = &vk.PipelineDepthStencilStateCreateInfo {
+						sType = .PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+						depthTestEnable = true,
+						depthWriteEnable = true,
+						depthCompareOp = .GREATER_OR_EQUAL,
+						front = {},
+						back = {},
+						depthBoundsTestEnable = false,
+						stencilTestEnable = false,
+						minDepthBounds = 0,
+						maxDepthBounds = 1,
+					},
 					pDynamicState       = &vk.PipelineDynamicStateCreateInfo {
 						sType = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
 						dynamicStateCount = u32(len(dynamic_states)),
@@ -725,7 +744,7 @@ main :: proc() {
 				// viewMask:                u32,
 				colorAttachmentCount    = u32(len(color_attach)),
 				pColorAttachmentFormats = raw_data(color_attach),
-				// depthAttachmentFormat:   Format,
+				depthAttachmentFormat   = state.depthimg.fmt,
 				// stencilAttachmentFormat: Format,
 			},
 			CheckVkResultFn = imguiCheckVkResult,
@@ -809,6 +828,7 @@ main :: proc() {
 			}
 
 			frame_num += 1
+			// return
 		}
 	}
 }
@@ -925,8 +945,12 @@ load_gltf_meshes :: proc(path: string) -> (meshes: []MeshAsset) {
 				}
 			}
 		}
+		// log.debugf("%v", vtxs.color)
 		verts := make([]Vertex, len(vtxs))
-		for v, i in vtxs do verts[i] = v
+		for v, i in vtxs {
+			verts[i] = v
+			verts[i].color = vec4{v.normal.x, v.normal.y, v.normal.z, 1.0}
+		}
 		name := strings.clone_from_cstring(mesh.name)
 		if len(idxs) == 0 {
 			log.debugf("skipping mesh %v with 0 indices and surfs %v", name, surfs)
@@ -1015,13 +1039,14 @@ upload_mesh :: proc(indices: []u32, vertices: []Vertex) -> (m: MeshBuffer) {
 	dest := map_memory(devmem, vk.DeviceSize(total_size))
 	assert(vtxbuf_size == copy(dest[:vtxbuf_size], slice.reinterpret([]byte, vertices)))
 	assert(idbuf_size == copy(dest[vtxbuf_size:], slice.reinterpret([]byte, indices)))
-	imm_exec(proc(cmd: vk.CommandBuffer, args: ..any) {
+	imm_exec(
+		proc(cmd: vk.CommandBuffer, args: ..any) {
 			src, vtx, idx: vk.Buffer
 			offset, total: vk.DeviceSize
 			src, _ = args[0].(vk.Buffer)
-			log.debugf("%v", src)
+			// log.debugf("%v", src)
 			vtx, _ = args[1].(vk.Buffer)
-			log.debugf("%v", vtx)
+			// log.debugf("%v", vtx)
 			idx, _ = args[2].(vk.Buffer)
 			offset, _ = args[3].(vk.DeviceSize)
 			total, _ = args[4].(vk.DeviceSize)
@@ -1033,7 +1058,13 @@ upload_mesh :: proc(indices: []u32, vertices: []Vertex) -> (m: MeshBuffer) {
 				1,
 				&vk.BufferCopy{srcOffset = offset, size = total - offset},
 			)
-		}, staging, m.vertices, m.indices, vk.DeviceSize(vtxbuf_size), vk.DeviceSize(total_size))
+		},
+		staging,
+		m.vertices,
+		m.indices,
+		vk.DeviceSize(vtxbuf_size),
+		vk.DeviceSize(total_size),
+	)
 	return
 }
 
@@ -1280,6 +1311,17 @@ draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer) {
 				loadOp = .LOAD,
 				storeOp = .STORE,
 			},
+			pDepthAttachment = &vk.RenderingAttachmentInfo {
+				sType = .RENDERING_ATTACHMENT_INFO,
+				imageView = state.depthimg.view,
+				imageLayout = .DEPTH_ATTACHMENT_OPTIMAL,
+				// resolveMode:        ResolveModeFlags,
+				// resolveImageView:   ImageView,
+				// resolveImageLayout: ImageLayout,
+				loadOp = .CLEAR,
+				storeOp = .STORE,
+				clearValue = {depthStencil = {depth = 0}},
+			},
 		},
 	)
 	vk.CmdBindPipeline(buf, .GRAPHICS, mode.pipeline)
@@ -1291,14 +1333,15 @@ draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer) {
 	)
 	vk.CmdSetScissor(buf, 0, 1, &vk.Rect2D{extent = state.ext})
 
-	perp := glsl.mat4Perspective(
+	perp := linalg.matrix4_perspective(
 		math.PI / 2.0,
 		f32(state.ext.width) / f32(state.ext.height),
 		0.1,
 		100,
+		flip_z_axis = true,
 	)
 	perp[1][1] *= -1
-	state.gfx_pushc.tr = perp * glsl.mat4Translate({0, 0, -2})
+	state.gfx_pushc.tr = perp * linalg.matrix4_translate_f32({0, 0, -3})
 	geo := &state.geometry[ig]
 	state.gfx_pushc.vert_addr = geo.buf.vtx_addr
 	vk.CmdPushConstants(
@@ -1356,6 +1399,7 @@ draw :: proc(geometry: Geometry, effect: Compute_Effect, n: u64) -> vk.Result {
 	// }
 
 	record(cmd, state.drawimg.buf, .GENERAL, .COLOR_ATTACHMENT_OPTIMAL)
+	record(cmd, state.depthimg.buf, .UNDEFINED, .DEPTH_ATTACHMENT_OPTIMAL)
 	draw_geometry(geometry, cmd)
 	record(cmd, state.drawimg.buf, .COLOR_ATTACHMENT_OPTIMAL, .GENERAL)
 	// record(cmd, state.drawimg.buf, .GENERAL, .TRANSFER_SRC_OPTIMAL)
@@ -1561,7 +1605,7 @@ create_swapchain :: proc() {
 			mipLevels   = 1,
 			arrayLayers = 1,
 			samples     = {._1},
-			tiling      = .LINEAR,
+			tiling      = .OPTIMAL,
 			usage       = {.TRANSFER_SRC, .TRANSFER_DST, .STORAGE, .COLOR_ATTACHMENT},
 			// sharingMode:           SharingMode,
 			// queueFamilyIndexCount: u32,
@@ -1600,6 +1644,42 @@ create_swapchain :: proc() {
 		0,
 		nil,
 	)
+
+
+	state.depthimg.fmt = .D32_SFLOAT
+	state.depthimg.ext = state.drawimg.ext
+	state.depthimg.buf, state.depthimg.mem = create_image(
+		&vk.ImageCreateInfo {
+			sType       = .IMAGE_CREATE_INFO,
+			flags       = {},
+			imageType   = .D2,
+			format      = state.depthimg.fmt,
+			extent      = state.depthimg.ext,
+			mipLevels   = 1,
+			arrayLayers = 1,
+			samples     = {._1},
+			tiling      = .OPTIMAL,
+			usage       = {.DEPTH_STENCIL_ATTACHMENT},
+			// sharingMode:           SharingMode,
+			// queueFamilyIndexCount: u32,
+			// pQueueFamilyIndices:   [^]u32,
+			// initialLayout = .,
+		},
+	)
+	must(
+		vk.CreateImageView(
+			state.device,
+			&vk.ImageViewCreateInfo {
+				sType = .IMAGE_VIEW_CREATE_INFO,
+				image = state.depthimg.buf,
+				viewType = .D2,
+				format = state.depthimg.fmt,
+				subresourceRange = sub_range({.DEPTH}),
+			},
+			nil,
+			&state.depthimg.view,
+		),
+	)
 }
 
 choose_swapchain_extent :: proc() -> vk.Extent2D {
@@ -1627,6 +1707,7 @@ destroy_swapchain :: proc() {
 	}
 	vk.DestroySwapchainKHR(state.device, state.swapchain.chain, nil)
 	destroy_image(state.drawimg)
+	destroy_image(state.depthimg)
 
 	// cleanup
 	// // All steps succeeded.
@@ -1731,6 +1812,9 @@ pick_physical_device :: proc() -> vk.Result {
 	}
 
 	if best_device_score == 0 do log.panic("vulkan: no suitable GPU found")
+	// fprops: vk.FormatProperties
+	// vk.GetPhysicalDeviceFormatProperties(state.physical_device, .R16G16B16A16_SFLOAT, &fprops)
+	// log.debugf("%v", fprops)
 	return .SUCCESS
 }
 
