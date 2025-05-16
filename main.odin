@@ -167,7 +167,7 @@ state := struct {
 		device:   vk.PhysicalDevice,
 		surf:     vk.SurfaceKHR,
 		caps:     vk.SurfaceCapabilitiesKHR,
-		mem:      vk.PhysicalDeviceMemoryProperties,
+		mem:      []vk.MemoryPropertyFlags,
 	},
 	window:          ^sdl.Window,
 	device:          vk.Device,
@@ -289,7 +289,10 @@ main :: proc() {
 	}
 
 	must(pick_physical_device())
-	vk.GetPhysicalDeviceMemoryProperties(state.phy.device, &state.phy.mem)
+	mem_prop: vk.PhysicalDeviceMemoryProperties
+	vk.GetPhysicalDeviceMemoryProperties(state.phy.device, &mem_prop)
+	state.phy.mem = make([]vk.MemoryPropertyFlags, int(mem_prop.memoryTypeCount))
+	for mtype, i in mem_prop.memoryTypes[:mem_prop.memoryTypeCount] do state.phy.mem[i] = mtype.propertyFlags
 
 	// gather all queues that support gfx
 	// TODO: gfx and present queues might be different in hybrid GPU systems, lol whatever man
@@ -993,6 +996,7 @@ upload_mesh :: proc(indices: []u32, vertices: []Vertex) -> (m: MeshBuffer) {
 	m.vertices, m.vtx_mem = create_buffer(
 		vk.DeviceSize(vtxbuf_size),
 		{.TRANSFER_DST, .STORAGE_BUFFER, .SHADER_DEVICE_ADDRESS},
+		.gpu_only,
 	)
 	addr_info := vk.BufferDeviceAddressInfo {
 		sType  = .BUFFER_DEVICE_ADDRESS_INFO,
@@ -1001,10 +1005,14 @@ upload_mesh :: proc(indices: []u32, vertices: []Vertex) -> (m: MeshBuffer) {
 	m.vtx_addr = vk.GetBufferDeviceAddress(state.device, &addr_info)
 
 	idbuf_size := size_of(u32) * len(indices)
-	m.indices, m.idx_mem = create_buffer(vk.DeviceSize(idbuf_size), {.TRANSFER_DST, .INDEX_BUFFER})
+	m.indices, m.idx_mem = create_buffer(
+		vk.DeviceSize(idbuf_size),
+		{.TRANSFER_DST, .INDEX_BUFFER},
+		.gpu_only,
+	)
 
 	total_size := vtxbuf_size + idbuf_size
-	staging, devmem := create_buffer(vk.DeviceSize(total_size), {.TRANSFER_SRC}, cpu_only = true)
+	staging, devmem := create_buffer(vk.DeviceSize(total_size), {.TRANSFER_SRC}, .cpu_copy)
 	addr_info.buffer = staging
 	defer vk.DestroyBuffer(state.device, staging, nil)
 	defer vk.FreeMemory(state.device, devmem, nil)
@@ -1048,22 +1056,24 @@ create_shader_module :: proc(code: []byte) -> (module: vk.ShaderModule) {
 	return
 }
 
-mtype :: proc(properties: vk.MemoryPropertyFlags, requiredTypeBits: u32) -> u32 {
-	for mtype, i in state.phy.mem.memoryTypes[:state.phy.mem.memoryTypeCount] {
-		if (1 << u32(i)) & requiredTypeBits == 0 do continue
-
-		if (properties & mtype.propertyFlags) != properties do continue
-
-		return u32(i)
-	}
-
+mtype :: proc(properties: vk.MemoryPropertyFlags, required: u32) -> u32 {
+	for mtype, i in state.phy.mem do if (1 << u32(i)) & required != 0 && (properties & mtype) == properties do return u32(i)
 	return 0
+}
+
+Buffer_Access :: enum {
+	// sequential access, no device access
+	cpu_copy,
+	// cached, device local, may not be host visible
+	cpu_random_access,
+	// device local
+	gpu_only,
 }
 
 create_buffer :: proc(
 	size: vk.DeviceSize,
 	usage: vk.BufferUsageFlags,
-	cpu_only: bool = false,
+	access: Buffer_Access,
 ) -> (
 	buf: vk.Buffer,
 	addr: vk.DeviceMemory,
@@ -1077,7 +1087,7 @@ create_buffer :: proc(
 		),
 	)
 
-	memReq := vk.MemoryRequirements2 {
+	required := vk.MemoryRequirements2 {
 		sType = .MEMORY_REQUIREMENTS_2,
 	}
 	vk.GetBufferMemoryRequirements2(
@@ -1086,17 +1096,25 @@ create_buffer :: proc(
 			sType = .BUFFER_MEMORY_REQUIREMENTS_INFO_2,
 			buffer = buf,
 		},
-		&memReq,
+		&required,
 	)
-	required := vk.MemoryPropertyFlags{.HOST_COHERENT, .HOST_VISIBLE}
-	if cpu_only do required |= {.DEVICE_LOCAL}
+	mem_props: vk.MemoryPropertyFlags
+	switch access {
+	case .cpu_copy:
+		mem_props |= {.HOST_VISIBLE}
+	case .cpu_random_access:
+		mem_props |= {.HOST_CACHED, .DEVICE_LOCAL}
+	case .gpu_only:
+		mem_props |= {.DEVICE_LOCAL}
+	}
+	// if !cpu_only do mem_props |= {.DEVICE_LOCAL}
 	must(
 		vk.AllocateMemory(
 			state.device,
 			&vk.MemoryAllocateInfo {
 				sType = .MEMORY_ALLOCATE_INFO,
-				allocationSize = memReq.memoryRequirements.size,
-				memoryTypeIndex = mtype(required, memReq.memoryRequirements.memoryTypeBits),
+				allocationSize = required.memoryRequirements.size,
+				memoryTypeIndex = mtype(mem_props, required.memoryRequirements.memoryTypeBits),
 				pNext = &vk.MemoryAllocateFlagsInfo {
 					sType = .MEMORY_ALLOCATE_FLAGS_INFO,
 					flags = {.DEVICE_ADDRESS},
