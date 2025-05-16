@@ -42,6 +42,8 @@ when ODIN_OS == .Darwin {
 	}
 }
 
+BLEND :: 1
+
 // Enables Vulkan debug logging and validation layers
 ENABLE_VALIDATION_LAYERS :: #config(ENABLE_VALIDATION_LAYERS, ODIN_DEBUG)
 
@@ -568,13 +570,13 @@ main :: proc() {
 		),
 	)
 	log.debugf("%v", state.modes[.compute].pipeline[:])
-	color_attach_render := []vk.Format{state.drawimg.fmt}
+	color_attach_render := []vk.Format{state.draw.fmt}
 	pipe_render := vk.PipelineRenderingCreateInfo {
 		sType                   = .PIPELINE_RENDERING_CREATE_INFO_KHR,
 		// viewMask:                u32,
 		colorAttachmentCount    = u32(len(color_attach_render)),
 		pColorAttachmentFormats = raw_data(color_attach_render),
-		depthAttachmentFormat   = state.depthimg.fmt,
+		depthAttachmentFormat   = state.depth.fmt,
 		// stencilAttachmentFormat: Format,
 	}
 
@@ -610,6 +612,29 @@ main :: proc() {
 				stage = {.FRAGMENT},
 				module = state.shaders[.flat],
 				pName = "main",
+			},
+		}
+		blends := []vk.PipelineColorBlendAttachmentState {
+			{colorWriteMask = {.R, .G, .B, .A}},
+			{
+				colorWriteMask = {.R, .G, .B, .A},
+				blendEnable = true,
+				srcColorBlendFactor = .SRC_ALPHA,
+				dstColorBlendFactor = .ONE,
+				colorBlendOp = .ADD,
+				srcAlphaBlendFactor = .ONE,
+				dstAlphaBlendFactor = .ZERO,
+				alphaBlendOp = .ADD,
+			},
+			{
+				colorWriteMask = {.R, .G, .B, .A},
+				blendEnable = true,
+				srcColorBlendFactor = .SRC_ALPHA,
+				dstColorBlendFactor = .ONE_MINUS_SRC_ALPHA,
+				colorBlendOp = .ADD,
+				srcAlphaBlendFactor = .ONE,
+				dstAlphaBlendFactor = .ZERO,
+				alphaBlendOp = .ADD,
 			},
 		}
 
@@ -650,9 +675,7 @@ main :: proc() {
 						sType = .PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
 						logicOp = .COPY,
 						attachmentCount = 1,
-						pAttachments = &vk.PipelineColorBlendAttachmentState {
-							colorWriteMask = {.R, .G, .B, .A},
-						},
+						pAttachments = &blends[BLEND],
 					},
 					pDepthStencilState  = &vk.PipelineDepthStencilStateCreateInfo {
 						sType = .PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
@@ -744,7 +767,7 @@ main :: proc() {
 				// viewMask:                u32,
 				colorAttachmentCount    = u32(len(color_attach)),
 				pColorAttachmentFormats = raw_data(color_attach),
-				depthAttachmentFormat   = state.depthimg.fmt,
+				depthAttachmentFormat   = state.depth.fmt,
 				// stencilAttachmentFormat: Format,
 			},
 			CheckVkResultFn = imguiCheckVkResult,
