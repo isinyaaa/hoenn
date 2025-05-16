@@ -6,6 +6,7 @@ import "core:fmt"
 import "core:log"
 import "core:math"
 import "core:math/linalg/glsl"
+import "core:mem"
 import "core:reflect"
 import "core:slice"
 import "core:strings"
@@ -13,6 +14,7 @@ import "core:strings"
 import imgui "vendor/imgui"
 import imdl "vendor/imgui/impl_sdl3"
 import imvk "vendor/imgui/impl_vulkan"
+import gltf "vendor:cgltf"
 import sdl "vendor:sdl3"
 import vk "vendor:vulkan"
 
@@ -47,6 +49,7 @@ GRAD_SHADER :: #load("shaders/gradient.spv")
 SKY_SHADER :: #load("shaders/sky.spv")
 COLORED_TRIANGLE_SHADER :: #load("shaders/colored_triangle.spv")
 FLAT_SHADER :: #load("shaders/flat.spv")
+GLB_PATH :: "assets/basicmesh.glb"
 
 INIT_RES :: [2]i32{1920, 1080}
 PROG :: "vk"
@@ -103,6 +106,17 @@ MeshBuffer :: struct {
 	vtx_addr: vk.DeviceAddress,
 }
 
+GeoSurface :: struct {
+	start: u32,
+	count: u32,
+}
+
+MeshAsset :: struct {
+	name:  string,
+	surfs: []GeoSurface,
+	buf:   MeshBuffer,
+}
+
 Pipeline :: struct {
 	pipeline: vk.Pipeline,
 	layout:   vk.PipelineLayout,
@@ -113,6 +127,13 @@ Vertex :: struct #min_field_align (16) {
 	color:  glsl.vec4,
 	normal: glsl.vec3,
 	uv:     glsl.vec2,
+}
+
+Geometry :: enum {
+	triangle,
+	cube,
+	sphere,
+	monkey,
 }
 
 state := struct {
@@ -129,7 +150,7 @@ state := struct {
 		pos:  glsl.vec4,
 		post: glsl.vec4,
 	},
-	geometry:        MeshBuffer,
+	geometry:        [Geometry]MeshAsset,
 	gfx_pushc:       struct {
 		tr:        glsl.mat4,
 		vert_addr: vk.DeviceAddress,
@@ -658,13 +679,22 @@ main :: proc() {
 		offset_of(Vertex, uv),
 	)
 	rect_indices := []u32{0, 1, 2, 2, 1, 3}
-	state.geometry = upload_mesh(rect_indices, vertices)
-	defer {
-		vk.DestroyBuffer(state.device, state.geometry.vertices, nil)
-		vk.FreeMemory(state.device, state.geometry.vtx_mem, nil)
-		vk.DestroyBuffer(state.device, state.geometry.indices, nil)
-		vk.FreeMemory(state.device, state.geometry.idx_mem, nil)
+	triangle := upload_mesh(rect_indices, vertices)
+	defer destroy_mesh(triangle)
+
+	meshes := load_gltf_meshes(GLB_PATH)
+	state.geometry = {
+		.triangle = MeshAsset {
+			name = "triangle",
+			surfs = []GeoSurface{{start = 0, count = 6}},
+			buf = triangle,
+		},
+		.cube = meshes[0],
+		.sphere = meshes[1],
+		.monkey = meshes[2],
 	}
+	defer for m in meshes do destroy_mesh(m.buf)
+
 	imgui.CreateContext()
 	imvk.LoadFunctions(
 		vk.API_VERSION_1_3,
@@ -710,8 +740,10 @@ main :: proc() {
 
 	frame_num: u64 = 0
 	do_render: bool = true
-	current: Compute_Effect
+	effect: Compute_Effect
 	compute_bound := i32(len(Compute_Effect))
+	geo_bound := i32(len(Geometry))
+	geometry: Geometry
 	// max_effects := compute_bound + i32(len(Gfx_Pipe)) - 1
 	// sel: Screen_Pipe
 	for {
@@ -741,18 +773,24 @@ main :: proc() {
 			imgui.NewFrame()
 
 			if imgui.Begin("background") {
-				name, _ := reflect.enum_name_from_value(current)
-				// if current < compute_bound {
-				// 	e := Compute_Effect(current)
+				efname, _ := reflect.enum_name_from_value(effect)
+				geoname, _ := reflect.enum_name_from_value(geometry)
+				// if effect < compute_bound {
+				// 	e := Compute_Effect(effect)
 				// 	name, _ = reflect.enum_name_from_value(e)
 				// 	sel = e
 				// } else {
-				// 	e := Gfx_Pipe(current - compute_bound)
+				// 	e := Gfx_Pipe(effect - compute_bound)
 				// 	sel = e
 				// 	name, _ = 
 				// }
-				imgui.Text(strings.clone_to_cstring(fmt.tprintf("Effect: %v", name)))
-				imgui.SliderInt("IDX", cast(^i32)&current, 0, compute_bound - 1)
+				imgui.Text(
+					strings.clone_to_cstring(
+						fmt.tprintf("Effect: %v\tGeometry: %v", efname, geoname),
+					),
+				)
+				imgui.SliderInt("FX", cast(^i32)&effect, 0, compute_bound - 1)
+				imgui.SliderInt("GEO", cast(^i32)&geometry, 0, geo_bound - 1)
 				imgui.InputFloat4("transform", &state.compute_pushc.tr)
 				imgui.InputFloat4("camera", &state.compute_pushc.cam)
 				imgui.InputFloat4("position", &state.compute_pushc.pos)
@@ -761,7 +799,7 @@ main :: proc() {
 			imgui.End()
 			// imgui.ShowDemoWindow()
 			imgui.Render()
-			r := draw(current, frame_num)
+			r := draw(geometry, effect, frame_num)
 			switch {
 			case r == .SUCCESS || r == .SUBOPTIMAL_KHR:
 			case r == .ERROR_OUT_OF_DATE_KHR:
@@ -774,6 +812,184 @@ main :: proc() {
 		}
 	}
 }
+
+// Vertex :: struct #min_field_align (16) {
+// 	position: Vec3,
+// 	texCoord: Vec2,
+// 	normal:   Vec3,
+// 	bones:    [4]u32,
+// 	weights:  Vec4,
+// }
+
+// Mesh :: struct {
+// 	name:         cstring,
+// 	vertices:     []Vertex,
+// 	indices:      []u32,
+// 	vertexOffset: u32,
+// 	indiceOffset: u32,
+// }
+
+// Model :: struct {
+// 	name:   cstring,
+// meshes: []MeshAsset,
+// skeleton:   Skeleton,
+// animations: []Animation,
+// }
+
+load_gltf_meshes :: proc(path: string) -> (meshes: []MeshAsset) {
+	opts := gltf.options {
+		type = .glb,
+	}
+	// gltf.parse_file()
+	file, r := gltf.parse_file(opts, strings.clone_to_cstring(path))
+	defer gltf.free(file)
+	assert(r == .success, "gltf: could not parse file")
+	r = gltf.load_buffers(opts, file, "assets/basicmesh.glb")
+	assert(r == .success, "gltf: coult not load buffers")
+	assert(gltf.validate(file) == .success, "gltf: coult not validate")
+	copyData :: proc(accessor: ^gltf.accessor, dst: rawptr) {
+		bufferView := accessor.buffer_view
+		data := bufferView.data
+		if data == nil {
+			data = bufferView.buffer.data
+		}
+		src := rawptr(uintptr(data) + uintptr(bufferView.offset))
+		size := int(bufferView.size)
+		// log.debugf("copying with %v %v %v", dst, src, size)
+		mem.copy(dst, src, size)
+	}
+
+	// model.name = fmt.caprint(file.meshes[0].name)
+
+	meshes = make([]MeshAsset, len(file.meshes))
+
+	for &mesh, m in file.meshes {
+		idxs: [dynamic]u32
+		vtxs: #soa[dynamic]Vertex
+		voff: u32
+		ioff: u32
+		surfs: [dynamic]GeoSurface
+		for &p in mesh.primitives {
+			if p.type != .triangles {
+				log.warnf("skipping %v primitive", p.type)
+				continue
+			}
+			surf := GeoSurface {
+				start = ioff,
+				count = u32(p.indices.count),
+			}
+			append(&surfs, surf)
+			// log.debug("new triangle")
+
+			resize(&idxs, int(surf.count))
+			idxs := idxs[ioff:]
+			ioff += surf.count
+
+			// mesh.indices = make([]u32, int(p.indices.count))
+
+			if p.indices.component_type == .r_32u {
+				log.debug("x")
+				copyData(p.indices, raw_data(idxs))
+			} else if p.indices.component_type == .r_16u {
+				// log.debug("y")
+				data := make([]u16, int(p.indices.count))
+				defer delete(data)
+				copyData(p.indices, raw_data(data))
+				for v, i in data do idxs[i] = u32(v)
+			} else if p.indices.component_type == .r_8u {
+				log.debug("z")
+				data := make([]u8, int(p.indices.count))
+				defer delete(data)
+				copyData(p.indices, raw_data(data))
+				for v, i in data do idxs[i] = u32(v)
+			}
+			resize(&vtxs, p.attributes[0].data.count)
+			// log.debugf("%v %v", len(p.attributes), p.attributes)
+			vtxs := vtxs[voff:]
+			voff += u32(p.attributes[0].data.count)
+
+			for &attribute in p.attributes {
+				#partial switch attribute.type {
+				case .position:
+					assert(attribute.data.type == .vec3)
+					copyData(attribute.data, raw_data(vtxs.pos[:]))
+				case .texcoord:
+					assert(attribute.data.type == .vec2)
+					copyData(attribute.data, raw_data(vtxs.uv[:]))
+				case .normal:
+					assert(attribute.data.type == .vec3)
+					copyData(attribute.data, raw_data(vtxs.normal[:]))
+				case .color:
+					assert(attribute.data.type == .vec4)
+					copyData(attribute.data, raw_data(vtxs.color[:]))
+				}
+			}
+		}
+		verts := make([]Vertex, len(vtxs))
+		for v, i in vtxs do verts[i] = v
+		name := strings.clone_from_cstring(mesh.name)
+		if len(idxs) == 0 {
+			log.debugf("skipping mesh %v with 0 indices and surfs %v", name, surfs)
+			continue
+		} else if len(vtxs) == 0 {
+			log.debugf("skipping mesh %v with 0 vertices and surfs %v", name, surfs)
+			continue
+		}
+		// log.debugf("allocating mesh %v: %v %v", name, idxs, verts)
+		meshes[m] = MeshAsset {
+			name  = name,
+			surfs = surfs[:],
+			buf   = upload_mesh(idxs[:], verts),
+		}
+	}
+	return
+}
+
+destroy_mesh :: proc(mesh: MeshBuffer) {
+	vk.DestroyBuffer(state.device, mesh.vertices, nil)
+	vk.FreeMemory(state.device, mesh.vtx_mem, nil)
+	vk.DestroyBuffer(state.device, mesh.indices, nil)
+	vk.FreeMemory(state.device, mesh.idx_mem, nil)
+}
+
+// 	scene := &scenes[sceneIndex]
+//
+// 	modelOffset := len(scene.models)
+// 	resize(&scene.models, modelOffset + len(modelPaths))
+//
+// 	for path, index in modelPaths {
+// 		modelIndex := modelOffset + index
+//
+// 		switch ext := filepath.ext(string(path))[1:]; ext {
+// 		case "obj":
+// 			fallthrough
+// 		case "fbx":
+// 			loadFBX(
+// 				path,
+// 				&scene.models[modelIndex],
+// 				u32(len(scene.vertices)),
+// 				u32(len(scene.indices)),
+// 			)
+// 		case "gltf":
+// 			fallthrough
+// 		case "glb":
+// 			loadGLTF(
+// 				path,
+// 				&scene.models[modelIndex],
+// 				u32(len(scene.vertices)),
+// 				u32(len(scene.indices)),
+// 			)
+// 		case:
+// 			log.log(.Warning, "File formate not supported! {}", ext)
+// 		}
+//
+// 		for &mesh in scene.models[modelIndex].meshes {
+// 			append(&scene.vertices, ..mesh.vertices)
+// 			append(&scene.indices, ..mesh.indices)
+// 		}
+// 	}
+// 	return
+// }
 
 upload_mesh :: proc(indices: []u32, vertices: []Vertex) -> (m: MeshBuffer) {
 	vtxbuf_size := size_of(Vertex) * len(vertices)
@@ -1047,7 +1263,7 @@ imm_exec :: proc(f: proc(_: vk.CommandBuffer, _: ..any), args: ..any) {
 	must(vk.WaitForFences(state.device, 1, &state.imm.fences[0], true, max(u64)))
 }
 
-draw_geometry :: proc(buf: vk.CommandBuffer) {
+draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer) {
 	mode := state.modes[.gfx][0]
 	vk.CmdBeginRendering(
 		buf,
@@ -1075,8 +1291,16 @@ draw_geometry :: proc(buf: vk.CommandBuffer) {
 	)
 	vk.CmdSetScissor(buf, 0, 1, &vk.Rect2D{extent = state.ext})
 
-	state.gfx_pushc.tr = glsl.mat4(1)
-	state.gfx_pushc.vert_addr = state.geometry.vtx_addr
+	perp := glsl.mat4Perspective(
+		math.PI / 2.0,
+		f32(state.ext.width) / f32(state.ext.height),
+		0.1,
+		100,
+	)
+	perp[1][1] *= -1
+	state.gfx_pushc.tr = perp * glsl.mat4Translate({0, 0, -2})
+	geo := &state.geometry[ig]
+	state.gfx_pushc.vert_addr = geo.buf.vtx_addr
 	vk.CmdPushConstants(
 		buf,
 		state.modes[.gfx].layout[0],
@@ -1085,13 +1309,13 @@ draw_geometry :: proc(buf: vk.CommandBuffer) {
 		size_of(state.gfx_pushc),
 		&state.gfx_pushc,
 	)
-	vk.CmdBindIndexBuffer(buf, state.geometry.indices, 0, .UINT32)
+	vk.CmdBindIndexBuffer(buf, geo.buf.indices, 0, .UINT32)
 
-	vk.CmdDrawIndexed(buf, 6, 1, 0, 0, 0)
+	vk.CmdDrawIndexed(buf, geo.surfs[0].count, 1, geo.surfs[0].start, 0, 0)
 	vk.CmdEndRendering(buf)
 }
 
-draw :: proc(effect: Compute_Effect, n: u64) -> vk.Result {
+draw :: proc(geometry: Geometry, effect: Compute_Effect, n: u64) -> vk.Result {
 	fid := n % MAX_FRAMES_IN_FLIGHT
 	must(vk.WaitForFences(state.device, 1, &state.swapchain.fences[fid], true, max(u64)))
 	// must(vk.WaitForFences(state.device, 1, &f.fence, true, max(u64)))
@@ -1132,7 +1356,7 @@ draw :: proc(effect: Compute_Effect, n: u64) -> vk.Result {
 	// }
 
 	record(cmd, state.drawimg.buf, .GENERAL, .COLOR_ATTACHMENT_OPTIMAL)
-	draw_geometry(cmd)
+	draw_geometry(geometry, cmd)
 	record(cmd, state.drawimg.buf, .COLOR_ATTACHMENT_OPTIMAL, .GENERAL)
 	// record(cmd, state.drawimg.buf, .GENERAL, .TRANSFER_SRC_OPTIMAL)
 	record(cmd, img, .UNDEFINED, .TRANSFER_DST_OPTIMAL)
@@ -1402,9 +1626,7 @@ destroy_swapchain :: proc() {
 		vk.DestroyImageView(state.device, view, nil)
 	}
 	vk.DestroySwapchainKHR(state.device, state.swapchain.chain, nil)
-	vk.DestroyImage(state.device, state.drawimg.buf, nil)
-	vk.FreeMemory(state.device, state.drawimg.mem, nil)
-	vk.DestroyImageView(state.device, state.drawimg.view, nil)
+	destroy_image(state.drawimg)
 
 	// cleanup
 	// // All steps succeeded.
@@ -1418,6 +1640,12 @@ destroy_swapchain :: proc() {
 	//     pAllocation);
 	// *pAllocation = VK_NULL_HANDLE;
 	// (*allocator->GetVulkanFunctions().vkDestroyImage)(allocator->m_hDevice, *pImage, allocator->GetAllocationCallbacks());
+}
+
+destroy_image :: proc(img: Image) {
+	vk.FreeMemory(state.device, img.mem, nil)
+	vk.DestroyImage(state.device, img.buf, nil)
+	vk.DestroyImageView(state.device, img.view, nil)
 }
 
 N_PHYS :: 3
