@@ -138,11 +138,6 @@ MeshAsset :: struct {
 	buf:   MeshBuffer,
 }
 
-Pipeline :: struct {
-	pipeline: vk.Pipeline,
-	layout:   vk.PipelineLayout,
-}
-
 vec2 :: [2]f32
 vec3 :: [3]f32
 vec4 :: [4]f32
@@ -182,6 +177,11 @@ Bound_Resource :: enum {
 	scene,
 }
 
+GPU_Queue :: struct {
+	q:   vk.Queue,
+	idx: u32,
+}
+
 state := struct {
 	phy:             struct {
 		instance: vk.Instance,
@@ -192,30 +192,33 @@ state := struct {
 	},
 	window:          ^sdl.Window,
 	device:          vk.Device,
-	gfx:             struct {
-		idx: u32,
-		q:   vk.Queue,
-	},
+	sync:            [MAX_FRAMES_IN_FLIGHT]Sync,
+	geometry:        [Geometry]MeshAsset,
+	submit:          GPU_Queue,
+	draw, depth:     Image,
+	pool:            vk.DescriptorPool,
+	descriptor:      vk.DescriptorSet,
+	shaders:         [Shader_Type]vk.ShaderModule,
 	// immediate mode
 	imm:             RenderData(1),
 	// dynamic render mode
 	using dyn:       struct {
-		render:        RenderData(MAX_FRAMES_IN_FLIGHT),
-		sync:          [MAX_FRAMES_IN_FLIGHT]Sync,
-		compute_pushc: struct {
-			tr, cam, pos, post: vec4,
+		render:  RenderData(MAX_FRAMES_IN_FLIGHT),
+		compute: struct {
+			layout:  vk.PipelineLayout,
+			effects: [2]vk.Pipeline,
+			pushc:   struct {
+				tr, cam, pos, post: vec4,
+			},
 		},
-		gfx_pushc:     struct {
-			tr:        mat4,
-			vert_addr: vk.DeviceAddress,
+		gfx:     struct {
+			layout: vk.PipelineLayout,
+			pipe:   vk.Pipeline,
+			pushc:  struct {
+				tr:        mat4,
+				vert_addr: vk.DeviceAddress,
+			},
 		},
-		geometry:      [Geometry]MeshAsset,
-		draw, depth:   Image,
-		shaders:       [Shader_Type]vk.ShaderModule,
-		modes:         [Pipe_Type]#soa[2]Pipeline,
-		pool:          vk.DescriptorPool,
-		frame_pools:   [MAX_FRAMES_IN_FLIGHT]vk.DescriptorPool,
-		descriptors:   [Bound_Resource]Descriptor,
 	},
 	swapchain:       struct {
 		chain:  vk.SwapchainKHR,
@@ -373,7 +376,7 @@ main :: proc() {
 				&state.device,
 			),
 		)
-		vk.GetDeviceQueue(state.device, q_infos.data[0].queueFamilyIndex, 0, &state.gfx.q)
+		vk.GetDeviceQueue(state.device, q_infos.data[0].queueFamilyIndex, 0, &state.submit.q)
 	}
 	defer vk.DestroyDevice(state.device, nil)
 	vk.load_proc_addresses_device(state.device)
@@ -401,6 +404,7 @@ main :: proc() {
 	state.swapchain.images = make([]vk.Image, state.swapchain.count)
 	state.swapchain.views = make([]vk.ImageView, state.swapchain.count)
 
+	dslayout: vk.DescriptorSetLayout
 	{
 		maxSets :: 10
 		state.pool = create_pool(
@@ -412,21 +416,18 @@ main :: proc() {
 			// {.COMBINED_IMAGE_SAMPLER, 4},
 		},
 		)
-		draw := descriptor_layout({.COMPUTE}, {.STORAGE_IMAGE})
+		dslayout = descriptor_layout({.COMPUTE}, {.STORAGE_IMAGE})
 		// image := descriptor_layout({.FRAGMENT}, {.COMBINED_IMAGE_SAMPLER})
 		// scene := descriptor_layout({.FRAGMENT, .VERTEX}, {.STORAGE_IMAGE})
-		state.descriptors[.draw] = { 	//{//.draw = 
-			set    = descriptor_set(state.pool, draw),
-			layout = draw,
-		}
+		state.descriptor = descriptor_set(state.pool, dslayout)
+		// layout = draw,
+		// }
 		// .image = {set = descriptor_set()},
 		// }
 	}
 	defer {
 		vk.DestroyDescriptorPool(state.device, state.pool, nil)
-		for d in state.descriptors {
-			vk.DestroyDescriptorSetLayout(state.device, d.layout, nil)
-		}
+		vk.DestroyDescriptorSetLayout(state.device, dslayout, nil)
 	}
 
 	create_swapchain()
@@ -442,7 +443,7 @@ main :: proc() {
 		pool_info := vk.CommandPoolCreateInfo {
 			sType            = .COMMAND_POOL_CREATE_INFO,
 			flags            = {.RESET_COMMAND_BUFFER},
-			queueFamilyIndex = state.gfx.idx,
+			queueFamilyIndex = state.submit.idx,
 		}
 		must(vk.CreateCommandPool(state.device, &pool_info, nil, &state.render.pool))
 		must(vk.CreateCommandPool(state.device, &pool_info, nil, &state.imm.pool))
@@ -523,15 +524,15 @@ main :: proc() {
 			&vk.PipelineLayoutCreateInfo {
 				sType = .PIPELINE_LAYOUT_CREATE_INFO,
 				setLayoutCount = 1,
-				pSetLayouts = &state.descriptors[.draw].layout,
+				pSetLayouts = &dslayout,
 				pushConstantRangeCount = 1,
 				pPushConstantRanges = &vk.PushConstantRange {
-					size = size_of(state.compute_pushc),
+					size = size_of(state.compute.pushc),
 					stageFlags = {.COMPUTE},
 				},
 			},
 			nil,
-			&state.modes[.compute][0].layout,
+			&state.compute.layout,
 		),
 	)
 
@@ -544,7 +545,7 @@ main :: proc() {
 				module = state.shaders[.gradient],
 				pName = "main",
 			},
-			layout = state.modes[.compute].layout[0],
+			layout = state.compute.layout,
 		},
 		{
 			sType = .COMPUTE_PIPELINE_CREATE_INFO,
@@ -554,7 +555,7 @@ main :: proc() {
 				module = state.shaders[.sky],
 				pName = "main",
 			},
-			layout = state.modes[.compute].layout[0],
+			layout = state.compute.layout,
 		},
 	}
 	// state.modes[.compute].layout[1] = state.modes[.compute].layout[0]
@@ -565,13 +566,17 @@ main :: proc() {
 			u32(len(pipe_infos)),
 			raw_data(pipe_infos),
 			nil,
-			raw_data(state.modes[.compute].pipeline[:]),
+			raw_data(state.compute.effects[:]),
 		),
 	)
-	color_attach_render := []vk.Format{state.draw.fmt}
+	defer {
+		vk.DestroyPipelineLayout(state.device, state.compute.layout, nil)
+		for fx in state.compute.effects do vk.DestroyPipeline(state.device, fx, nil)
+	}
 
 	// gfx pipeline
 	{
+		color_attach_render := []vk.Format{state.draw.fmt}
 		dynamic_states := []vk.DynamicState{.VIEWPORT, .SCISSOR}
 		must(
 			vk.CreatePipelineLayout(
@@ -579,15 +584,15 @@ main :: proc() {
 				&vk.PipelineLayoutCreateInfo {
 					sType = .PIPELINE_LAYOUT_CREATE_INFO,
 					setLayoutCount = 1,
-					pSetLayouts = &state.descriptors[.draw].layout,
+					pSetLayouts = &dslayout,
 					pushConstantRangeCount = 1,
 					pPushConstantRanges = &vk.PushConstantRange {
-						size = size_of(state.gfx_pushc),
+						size = size_of(state.gfx.pushc),
 						stageFlags = {.VERTEX},
 					},
 				},
 				nil,
-				&state.modes[.gfx][0].layout,
+				&state.gfx.layout,
 			),
 		)
 		stages := []vk.PipelineShaderStageCreateInfo {
@@ -679,7 +684,7 @@ main :: proc() {
 						dynamicStateCount = u32(len(dynamic_states)),
 						pDynamicStates = raw_data(dynamic_states),
 					},
-					layout              = state.modes[.gfx].layout[0],
+					layout              = state.gfx.layout,
 					pNext               = &vk.PipelineRenderingCreateInfo {
 						sType                   = .PIPELINE_RENDERING_CREATE_INFO_KHR,
 						// viewMask:                u32,
@@ -690,13 +695,13 @@ main :: proc() {
 					},
 				},
 				nil,
-				&state.modes[.gfx].pipeline[0],
+				&state.gfx.pipe,
 			),
 		)
 	}
-	defer for modes in state.modes do for p in modes {
-		vk.DestroyPipelineLayout(state.device, p.layout, nil)
-		vk.DestroyPipeline(state.device, p.pipeline, nil)
+	defer {
+		vk.DestroyPipelineLayout(state.device, state.gfx.layout, nil)
+		vk.DestroyPipeline(state.device, state.gfx.pipe, nil)
 	}
 
 	vertices := []Vertex {
@@ -765,8 +770,8 @@ main :: proc() {
 			Instance = state.phy.instance,
 			PhysicalDevice = state.phy.device,
 			Device = state.device,
-			QueueFamily = state.gfx.idx,
-			Queue = state.gfx.q,
+			QueueFamily = state.submit.idx,
+			Queue = state.submit.q,
 			DescriptorPool = impool,
 			MinImageCount = state.swapchain.count,
 			ImageCount = state.swapchain.count,
@@ -832,10 +837,10 @@ main :: proc() {
 				imgui.SliderInt("FX", cast(^i32)&effect, 0, compute_bound - 1)
 				imgui.SliderInt("GEO", cast(^i32)&geometry, 0, geo_bound - 1)
 				imgui.SliderFloat("SCALE", cast(^f32)&scale, 0.3, 1)
-				imgui.InputFloat4("transform", &state.compute_pushc.tr)
-				imgui.InputFloat4("camera", &state.compute_pushc.cam)
-				imgui.InputFloat4("position", &state.compute_pushc.pos)
-				imgui.InputFloat4("post-transform", &state.compute_pushc.post)
+				imgui.InputFloat4("transform", &state.compute.pushc.tr)
+				imgui.InputFloat4("camera", &state.compute.pushc.cam)
+				imgui.InputFloat4("position", &state.compute.pushc.pos)
+				imgui.InputFloat4("post-transform", &state.compute.pushc.post)
 			}
 			imgui.End()
 			imgui.Render()
@@ -912,6 +917,15 @@ descriptor_layout :: proc(
 			descriptorType  = d,
 		}
 	}
+	// TODO: need same amount as binds
+	flags := []vk.DescriptorBindingFlags {
+		{
+			.UPDATE_AFTER_BIND,
+			.UPDATE_UNUSED_WHILE_PENDING,
+			.PARTIALLY_BOUND,
+			// .VARIABLE_DESCRIPTOR_COUNT       ,
+		},
+	}
 	must(
 		vk.CreateDescriptorSetLayout(
 			state.device,
@@ -919,6 +933,11 @@ descriptor_layout :: proc(
 				sType = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
 				bindingCount = u32(len(binds)),
 				pBindings = raw_data(binds),
+				pNext = &vk.DescriptorSetLayoutBindingFlagsCreateInfo {
+					sType = .DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+					bindingCount = u32(len(binds)),
+					pBindingFlags = raw_data(flags),
+				},
 			},
 			nil,
 			&dsl,
@@ -1233,27 +1252,17 @@ draw_background :: proc(
 	effect: Compute_Effect,
 	n: u64,
 ) {
-	ef := &state.modes[.compute][effect]
-	vk.CmdBindPipeline(buf, .COMPUTE, ef.pipeline)
-	vk.CmdBindDescriptorSets(
-		buf,
-		.COMPUTE,
-		state.modes[.compute].layout[0],
-		0,
-		1,
-		&state.descriptors[.draw].set,
-		0,
-		nil,
-	)
-	state.compute_pushc.tr = {0.0, 0.0, math.abs(math.sin(f32(n) / 120.0)), 1.0}
-	state.compute_pushc.cam = {0.0, math.abs(math.cos(f32(n) / 120.0)), 0.0, 1.0}
+	vk.CmdBindPipeline(buf, .COMPUTE, state.compute.effects[effect])
+	vk.CmdBindDescriptorSets(buf, .COMPUTE, state.compute.layout, 0, 1, &state.descriptor, 0, nil)
+	state.compute.pushc.tr = {0.0, 0.0, math.abs(math.sin(f32(n) / 120.0)), 1.0}
+	state.compute.pushc.cam = {0.0, math.abs(math.cos(f32(n) / 120.0)), 0.0, 1.0}
 	vk.CmdPushConstants(
 		buf,
-		state.modes[.compute].layout[0],
+		state.compute.layout,
 		{.COMPUTE},
 		0,
-		size_of(state.compute_pushc),
-		&state.compute_pushc,
+		size_of(state.compute.pushc),
+		&state.compute.pushc,
 	)
 	vk.CmdDispatch(
 		buf,
@@ -1261,6 +1270,16 @@ draw_background :: proc(
 		u32(math.ceil(f32(extent.height) / 16.0)),
 		1,
 	)
+}
+
+bind_mem :: proc(
+	cmd: vk.CommandBuffer,
+	layout: vk.DescriptorSetLayout,
+	point: vk.PipelineBindPoint,
+	first: u32,
+	ds: vk.DescriptorSet,
+) {
+
 }
 
 draw_imgui :: proc(buf: vk.CommandBuffer, view: vk.ImageView, extent: vk.Extent2D) {
@@ -1309,12 +1328,11 @@ imm_exec :: proc(f: proc(_: vk.CommandBuffer, _: ..any), args: ..any) {
 			commandBuffer = frame.cmd,
 		},
 	}
-	must(vk.QueueSubmit2(state.gfx.q, 1, &submit_info, frame.fence))
+	must(vk.QueueSubmit2(state.submit.q, 1, &submit_info, frame.fence))
 	must(vk.WaitForFences(state.device, 1, &frame.fence, true, max(u64)))
 }
 
 draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer, extent: vk.Extent2D) {
-	mode := state.modes[.gfx][0]
 	vk.CmdBeginRendering(
 		buf,
 		&vk.RenderingInfo {
@@ -1338,7 +1356,7 @@ draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer, extent: vk.Extent2D) 
 			},
 		},
 	)
-	vk.CmdBindPipeline(buf, .GRAPHICS, mode.pipeline)
+	vk.CmdBindPipeline(buf, .GRAPHICS, state.gfx.pipe)
 	vk.CmdSetViewport(
 		buf,
 		0,
@@ -1355,16 +1373,16 @@ draw_geometry :: proc(ig: Geometry, buf: vk.CommandBuffer, extent: vk.Extent2D) 
 		flip_z_axis = true,
 	)
 	perp[1][1] *= -1
-	state.gfx_pushc.tr = perp * linalg.matrix4_translate_f32({0, 0, -3})
+	state.gfx.pushc.tr = perp * linalg.matrix4_translate_f32({0, 0, -3})
 	geo := &state.geometry[ig]
-	state.gfx_pushc.vert_addr = geo.buf.vtx_addr
+	state.gfx.pushc.vert_addr = geo.buf.vtx_addr
 	vk.CmdPushConstants(
 		buf,
-		state.modes[.gfx].layout[0],
+		state.gfx.layout,
 		{.VERTEX},
 		0,
-		size_of(state.gfx_pushc),
-		&state.gfx_pushc,
+		size_of(state.gfx.pushc),
+		&state.gfx.pushc,
 	)
 	vk.CmdBindIndexBuffer(buf, geo.buf.indices, 0, .UINT32)
 
@@ -1440,7 +1458,7 @@ draw :: proc(
 		signalSemaphoreInfoCount = 1,
 		pSignalSemaphoreInfos    = &ps,
 	}
-	must(vk.QueueSubmit2(state.gfx.q, 1, &submit_info, frame.fence))
+	must(vk.QueueSubmit2(state.submit.q, 1, &submit_info, frame.fence))
 
 	present_info := vk.PresentInfoKHR {
 		sType              = .PRESENT_INFO_KHR,
@@ -1455,7 +1473,7 @@ draw :: proc(
 		pSwapchains        = &state.swapchain.chain,
 		pImageIndices      = &image_index,
 	}
-	return vk.QueuePresentKHR(state.gfx.q, &present_info)
+	return vk.QueuePresentKHR(state.submit.q, &present_info)
 }
 
 cpimg :: proc(buf: vk.CommandBuffer, src, dest: vk.Image, sext, dext: vk.Extent2D) {
@@ -1564,15 +1582,7 @@ create_drawsurf :: proc(ext: vk.Extent2D) {
 		),
 	)
 
-	write_set(
-		state.descriptors[.draw].set,
-		0,
-		state.draw.view,
-		state.draw.img,
-		{},
-		.GENERAL,
-		.STORAGE_IMAGE,
-	)
+	write_set(state.descriptor, 0, state.draw.view, state.draw.img, {}, .GENERAL, .STORAGE_IMAGE)
 
 	state.depth.fmt = .D32_SFLOAT
 	state.depth.img, state.depth.mem = create_image(
