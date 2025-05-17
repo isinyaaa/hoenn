@@ -11,7 +11,7 @@ struct Vertex {
 	vec2 uv;
 };
 
-layout(buffer_reference, std430) readonly buffer VertexBuffer {
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer VertexBuffer {
 	Vertex vertices[];
 };
 

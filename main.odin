@@ -207,17 +207,17 @@ state := struct {
 		compute: struct {
 			layout:  vk.PipelineLayout,
 			effects: [2]vk.Pipeline,
-			pushc:   struct {
+			pushc:   struct #min_field_align (8) {
 				tr, cam, pos, post: vec4,
 			},
 		},
 		gfx:     struct {
 			layout: vk.PipelineLayout,
 			pipe:   vk.Pipeline,
-			pushc:  struct {
-				tr:        mat4,
-				vert_addr: vk.DeviceAddress,
-			},
+			pushc:  struct #min_field_align (8) {
+	tr:        mat4,
+	vert_addr: vk.DeviceAddress,
+},
 		},
 	},
 	swapchain:       struct {
@@ -255,12 +255,11 @@ main :: proc() {
 	}
 	{
 		count: u32
-		exts := slice.from_ptr(sdl.Vulkan_GetInstanceExtensions(&count), int(count))
-		extensions := slice.clone_to_dynamic(exts, context.temp_allocator)
-		when ODIN_OS == .Darwin {
-			create_info.flags |= {.ENUMERATE_PORTABILITY_KHR}
-			append(&extensions, vk.KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)
-		}
+		extensions := slice.clone_to_dynamic(
+			slice.from_ptr(sdl.Vulkan_GetInstanceExtensions(&count), int(count)),
+			context.temp_allocator,
+		)
+		for ext in extensions do if ext == vk.KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME do create_info.flags |= {.ENUMERATE_PORTABILITY_KHR}
 		when ENABLE_VALIDATION_LAYERS {
 			create_info.ppEnabledLayerNames = raw_data([]cstring{"VK_LAYER_KHRONOS_validation"})
 			create_info.enabledLayerCount = 1
