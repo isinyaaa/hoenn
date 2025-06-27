@@ -82,7 +82,7 @@ SURF_FMT :: vk.SurfaceFormatKHR {
 // default present mode
 PMODE: vk.PresentModeKHR = .FIFO
 // max frames to handle in app, most devices want at least 3 swapchain images
-MAX_FRAMES_IN_FLIGHT :: 2
+MAX_FRAMES_IN_FLIGHT :: 3
 
 g_ctx: runtime.Context
 
@@ -192,7 +192,7 @@ state := struct {
 	},
 	window:          ^sdl.Window,
 	device:          vk.Device,
-	sync:            [MAX_FRAMES_IN_FLIGHT]Sync,
+	sync:            [MAX_FRAMES_IN_FLIGHT + 1]Sync,
 	geometry:        [Geometry]MeshAsset,
 	submit:          GPU_Queue,
 	draw, depth:     Image,
@@ -215,17 +215,17 @@ state := struct {
 			layout: vk.PipelineLayout,
 			pipe:   vk.Pipeline,
 			pushc:  struct #min_field_align (8) {
-	tr:        mat4,
-	vert_addr: vk.DeviceAddress,
-},
+				tr:        mat4,
+				vert_addr: vk.DeviceAddress,
+			},
 		},
 	},
 	swapchain:       struct {
 		chain:  vk.SwapchainKHR,
 		ext:    vk.Extent2D,
-		count:  u32,
-		images: []vk.Image,
-		views:  []vk.ImageView,
+		// count:  u32,
+		images: [MAX_FRAMES_IN_FLIGHT]vk.Image,
+		views:  [MAX_FRAMES_IN_FLIGHT]vk.ImageView,
 	},
 	winext, drawext: vk.Extent2D,
 }{}
@@ -394,14 +394,7 @@ main :: proc() {
 			&state.phy.caps,
 		),
 	)
-	count := state.phy.caps.minImageCount + 1
-	if state.phy.caps.maxImageCount > 0 {
-		count = min(count, state.phy.caps.maxImageCount)
-	}
-	assert(count > 0, "no swapchain")
-	state.swapchain.count = count
-	state.swapchain.images = make([]vk.Image, state.swapchain.count)
-	state.swapchain.views = make([]vk.ImageView, state.swapchain.count)
+	assert(state.phy.caps.maxImageCount >= 3 && state.phy.caps.minImageCount <= 3, "no swapchain")
 
 	dslayout: vk.DescriptorSetLayout
 	{
@@ -772,8 +765,8 @@ main :: proc() {
 			QueueFamily = state.submit.idx,
 			Queue = state.submit.q,
 			DescriptorPool = impool,
-			MinImageCount = state.swapchain.count,
-			ImageCount = state.swapchain.count,
+			MinImageCount = MAX_FRAMES_IN_FLIGHT,
+			ImageCount = MAX_FRAMES_IN_FLIGHT,
 			// MSAASamples = ._1,
 			UseDynamicRendering = true,
 			PipelineRenderingCreateInfo = {
@@ -1396,9 +1389,10 @@ draw :: proc(
 	n: u64,
 ) -> vk.Result {
 	fid := n % MAX_FRAMES_IN_FLIGHT
-	frame := &state.render.frames[fid]
 	sync := &state.sync[fid]
+	frame := &state.render.frames[fid]
 	must(vk.WaitForFences(state.device, 1, &frame.fence, true, max(u64)))
+	must(vk.ResetFences(state.device, 1, &frame.fence))
 
 	image_index: u32
 	if r := vk.AcquireNextImageKHR(
@@ -1411,7 +1405,6 @@ draw :: proc(
 	); r != .SUCCESS && r != .SUBOPTIMAL_KHR {
 		return r
 	}
-	must(vk.ResetFences(state.device, 1, &frame.fence))
 
 	must(vk.ResetCommandBuffer(frame.cmd, {}))
 	must(
@@ -1673,7 +1666,7 @@ create_swapchain :: proc() {
 			&vk.SwapchainCreateInfoKHR {
 				sType            = .SWAPCHAIN_CREATE_INFO_KHR,
 				surface          = state.phy.surf,
-				minImageCount    = state.swapchain.count,
+				minImageCount    = MAX_FRAMES_IN_FLIGHT,
 				imageFormat      = SURF_FMT.format,
 				imageColorSpace  = SURF_FMT.colorSpace,
 				imageExtent      = state.winext,
@@ -1694,7 +1687,7 @@ create_swapchain :: proc() {
 		),
 	)
 
-	count: u32 = state.swapchain.count
+	count: u32 = MAX_FRAMES_IN_FLIGHT
 	must(
 		vk.GetSwapchainImagesKHR(
 			state.device,
